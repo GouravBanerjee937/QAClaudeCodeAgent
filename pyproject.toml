@@ -10,6 +10,7 @@ dependencies = [
     "prompts>=0.0.1",
     "pypdf2>=3.0.1",
     "pytest>=9.0.3",
+    "pytest-playwright>=0.8.0",
     "python-docx>=1.2.0",
     "python-dotenv>=1.2.2",
     "streamlit>=1.57.0",

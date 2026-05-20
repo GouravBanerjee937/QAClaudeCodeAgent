@@ -9,8 +9,12 @@ The Orchestrator checks that:
 
 from __future__ import annotations
 
+import re
+
 from ..events import EventBus
 from ..models import GeneratedTest, SiteMap, TestPlan, TestSpec
+
+_PLACEHOLDER_RE = re.compile(r"\{([a-z][a-z0-9-]*)\}")
 
 
 class OrchestrationError:
@@ -23,6 +27,50 @@ class OrchestrationError:
 
     def __str__(self) -> str:
         return f"{self.test_case_id}: {self.issue}"
+
+
+def resolve_placeholders(
+    plan: TestPlan,
+    answers: dict[str, str],
+    fallback_url: str,
+    bus: EventBus,
+) -> None:
+    """Substitute {key} placeholders in test case URLs in-place.
+
+    The Designer sometimes emits keys like `{login-url}` in page_urls that
+    aren't in the answers dict. Without this, the Coder writes
+    `page.goto("{login-url}")` which obviously fails. We replace each
+    placeholder with the matching answer, or fall back to the app URL.
+    """
+    substituted = 0
+    for tc in plan.test_cases:
+        new_urls: list[str] = []
+        for u in tc.page_urls:
+            keys = _PLACEHOLDER_RE.findall(u)
+            if not keys:
+                new_urls.append(u)
+                continue
+            resolved = u
+            for k in keys:
+                if k in answers and answers[k]:
+                    resolved = resolved.replace("{" + k + "}", answers[k])
+                else:
+                    resolved = fallback_url
+                    bus.emit(
+                        "orchestrator",
+                        f"  {tc.id}: URL placeholder {{{k}}} has no answer — "
+                        f"falling back to app URL",
+                        level="warn",
+                    )
+                    break
+            new_urls.append(resolved)
+            substituted += 1
+        tc.page_urls = new_urls
+    if substituted:
+        bus.emit(
+            "orchestrator",
+            f"Resolved placeholders in {substituted} test-case URL(s)",
+        )
 
 
 def validate_orchestration(

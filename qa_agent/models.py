@@ -14,6 +14,12 @@ class UserFlow(BaseModel):
     description: str = Field(description="What the user is trying to accomplish")
 
 
+class ProvidedValue(BaseModel):
+    """A concrete value literally stated in the PRD that the test will need."""
+    key: str = Field(description="kebab-case identifier, e.g. 'login-username'")
+    value: str = Field(description="the literal value as stated in the PRD")
+
+
 class TestSpec(BaseModel):
     """Step 1 output — structured understanding of the PRD."""
     app_name: str
@@ -22,7 +28,19 @@ class TestSpec(BaseModel):
     acceptance_criteria: list[str] = Field(
         description="Specific, testable success conditions stated in or implied by the PRD"
     )
+    provided_values: list[ProvidedValue] = Field(
+        description=(
+            "Concrete values literally stated in the PRD (credentials, sample inputs, "
+            "specific URLs). Keys are kebab-case (e.g. 'login-username', 'login-password'). "
+            "These feed directly into the answers dict so the Inquirer can skip asking and "
+            "the Coder still has values to substitute. Return [] if nothing is stated."
+        ),
+    )
     notes: str = Field(default="", description="Anything the analyst flagged as ambiguous")
+
+    @property
+    def provided_values_dict(self) -> dict[str, str]:
+        return {pv.key: pv.value for pv in self.provided_values}
 
 
 class Question(BaseModel):

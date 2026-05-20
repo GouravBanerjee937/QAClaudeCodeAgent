@@ -36,13 +36,18 @@ def code(
     return generated
 
 
-def _resolve_url(app_url: str, path: str) -> str:
+def resolve_url(app_url: str, path: str) -> str:
     """Join app_url + path the way browsers do, even when app_url has its own path."""
-    if path.startswith("http://") or path.startswith("https://"):
+    if path.startswith(("http://", "https://", "file://")):
         return path
+    parsed = urlparse(app_url)
+    if parsed.scheme == "file" or not parsed.netloc:
+        # file:// SPAs only support hash routing — preserve the app's file path.
+        base_no_frag = urlunparse(parsed._replace(fragment=""))
+        fragment = path if path.startswith("#") else "#/" + path.lstrip("/")
+        return base_no_frag + fragment
     # Build a clean base = scheme + host (no path) so urljoin handles "/foo" right
     # whether app_url is "https://x.com" or "https://x.com/login".
-    parsed = urlparse(app_url)
     origin = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
     if path.startswith("/"):
         return urljoin(origin + "/", path.lstrip("/"))
@@ -53,7 +58,7 @@ def _build_prompt(
     spec: TestSpec, tc: TestCase, sitemap: SiteMap, answers: dict[str, str]
 ) -> str:
     snapshots = _relevant_pages(tc, sitemap)
-    resolved = {u: _resolve_url(spec.app_url, u) for u in tc.page_urls}
+    resolved = {u: resolve_url(spec.app_url, u) for u in tc.page_urls}
     parts = [
         f"# app_url\n{spec.app_url}",
         "",

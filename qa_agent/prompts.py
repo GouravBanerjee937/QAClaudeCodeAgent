@@ -12,6 +12,17 @@ the primary subject of the PRD.
 not "good UX"). One criterion per item.
 - If you have to guess, do NOT — list the ambiguity in the `notes` field. The pipeline will \
 ask the user to fill in the gap.
+- `provided_values`: a list of `{key, value}` items for any concrete value LITERALLY \
+stated in the PRD that a test will need to type or use — credentials, sample form data, \
+named entities, specific URLs. Use kebab-case keys that match what later steps will \
+reference, e.g. `login-username`, `login-password`, `login-email`, `dashboard-url`. \
+Examples:
+  * PRD says "username is Gourav, password is 1234" → \
+    `[{"key":"login-username","value":"Gourav"}, {"key":"login-password","value":"1234"}]`
+  * PRD says "log in with email alice@example.com / hunter2" → \
+    `[{"key":"login-email","value":"alice@example.com"}, {"key":"login-password","value":"hunter2"}]`
+  * PRD does not provide credentials → return `[]`; the Inquirer will ask.
+  Only extract values that are unambiguously stated. Do not guess defaults.
 """
 
 INQUIRER_SYSTEM = """You are a senior QA engineer reviewing a TestSpec. Your job is to \

@@ -14,6 +14,10 @@ load_dotenv()
 _MODEL = os.getenv("QA_AGENT_MODEL", "gpt-4.1-mini")
 _client: OpenAI | None = None
 
+# Reasoning / GPT-5 family only accept the default temperature (1.0); passing
+# any other value 400s. For these models we omit the kwarg entirely.
+_FIXED_TEMP_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -27,6 +31,12 @@ def _get_client() -> OpenAI:
             )
         _client = OpenAI(api_key=api_key)
     return _client
+
+
+def _temp_kwargs(temperature: float) -> dict:
+    if any(_MODEL.startswith(p) for p in _FIXED_TEMP_PREFIXES):
+        return {}
+    return {"temperature": temperature}
 
 
 def structured(
@@ -44,7 +54,7 @@ def structured(
             {"role": "user", "content": user},
         ],
         response_format=schema,
-        temperature=temperature,
+        **_temp_kwargs(temperature),
     )
     parsed = response.choices[0].message.parsed
     if parsed is None:
@@ -60,6 +70,6 @@ def text(system: str, user: str, *, temperature: float = 0.2) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=temperature,
+        **_temp_kwargs(temperature),
     )
     return response.choices[0].message.content or ""

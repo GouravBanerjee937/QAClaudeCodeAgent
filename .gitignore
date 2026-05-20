@@ -25,6 +25,10 @@ __pycache__/
 # Playwright
 test-results/
 
+# QA Agent run artifacts (regenerated per run)
+reports/
+tests_generated/
+
 # User specific saves
 saved_user_story.txt
 saved_user_story_multipage.txt

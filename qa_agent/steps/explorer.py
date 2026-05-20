@@ -9,8 +9,6 @@ LLM part: labels each pair with a one-line purpose. It never invents elements.
 
 from __future__ import annotations
 
-from urllib.parse import urljoin
-
 from playwright.sync_api import Page, sync_playwright
 from pydantic import BaseModel
 
@@ -18,6 +16,7 @@ from ..events import EventBus
 from ..llm import structured
 from ..models import PageElement, PageSnapshot, SiteMap, TestPlan, TestSpec
 from ..prompts import EXPLORER_LABELER_SYSTEM
+from .coder import resolve_url
 
 
 _EMAIL_HINTS = ("email", "mobile", "username", "user name", "user-name", "login id", "phone")
@@ -115,6 +114,22 @@ def _explore_url(
     _quiet_wait(page)
 
     raw_elements = _scrape_elements(page)
+    # SPAs often render async — if first scrape is empty, give the page another
+    # moment and retry up to twice before giving up.
+    for attempt in range(2):
+        if raw_elements:
+            break
+        bus.emit(
+            "explorer",
+            f"   empty scrape on attempt {attempt+1} — waiting and retrying…",
+            level="warn",
+        )
+        try:
+            page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        _quiet_wait(page)
+        raw_elements = _scrape_elements(page)
     bus.emit("explorer", f"   found {len(raw_elements)} interactable element(s)")
 
     logged_in = False
@@ -292,8 +307,7 @@ def _collect_urls(spec: TestSpec, plan: TestPlan) -> dict[str, str]:
     for tc in plan.test_cases:
         urls = tc.page_urls or [base]
         for u in urls:
-            absolute = u if u.startswith("http") else urljoin(base, u)
-            seen.setdefault(u, absolute)
+            seen.setdefault(u, resolve_url(base, u))
     if not seen:
         seen[base] = base
     return seen

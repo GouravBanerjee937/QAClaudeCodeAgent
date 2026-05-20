@@ -47,10 +47,8 @@ def heal(
             continue
         for url in tc.page_urls:
             if url not in urls_to_refresh:
-                from urllib.parse import urljoin
-                urls_to_refresh[url] = (
-                    url if url.startswith("http") else urljoin(spec.app_url, url)
-                )
+                from .coder import resolve_url
+                urls_to_refresh[url] = resolve_url(spec.app_url, url)
 
     if urls_to_refresh:
         bus.emit("healer", f"Re-snapshotting {len(urls_to_refresh)} URL(s) fresh…")

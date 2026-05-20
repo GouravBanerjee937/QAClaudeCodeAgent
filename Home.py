@@ -141,10 +141,17 @@ if st.session_state.phase == "questions":
 
     questions: list[Question] = phase_a.questions.items
 
+    provided = spec.provided_values_dict
+
     if not questions:
         st.success("Spec is complete — no values needed from you.")
+        if provided:
+            with st.expander(f"Using {len(provided)} value(s) extracted from the PRD", expanded=False):
+                for k, v in provided.items():
+                    display = "•" * len(v) if "password" in k.lower() else v
+                    st.markdown(f"- `{k}` = `{display}`")
         if st.button("Continue", type="primary"):
-            st.session_state.answers = {}
+            st.session_state.answers = provided
             st.session_state.phase = "phase_b"
             st.rerun()
     else:
@@ -154,10 +161,11 @@ if st.session_state.phase == "questions":
             answers: dict[str, str] = {}
             for q in questions:
                 widget_key = f"q::{q.key}"
+                default = provided.get(q.key, "")
                 if q.kind == "password":
-                    val = st.text_input(q.prompt, key=widget_key, type="password", help=q.hint or None)
+                    val = st.text_input(q.prompt, key=widget_key, type="password", value=default, help=q.hint or None)
                 else:
-                    val = st.text_input(q.prompt, key=widget_key, help=q.hint or None)
+                    val = st.text_input(q.prompt, key=widget_key, value=default, help=q.hint or None)
                 if q.reason:
                     st.caption(f"_{q.reason}_")
                 answers[q.key] = val
@@ -167,7 +175,8 @@ if st.session_state.phase == "questions":
                 if missing:
                     st.warning(f"Please fill in: {', '.join(missing)}")
                 else:
-                    st.session_state.answers = answers
+                    # Merge: PRD-extracted values first, form answers override.
+                    st.session_state.answers = {**provided, **answers}
                     st.session_state.phase = "phase_b"
                     st.rerun()
 

@@ -56,6 +56,9 @@ def run_phase_b(
 ) -> PhaseB:
     out = PhaseB()
     out.plan = designer.design(spec, answers, bus)
+    # Resolve any `{key}` placeholders the Designer baked into URLs, so we don't
+    # send literal "{login-url}" strings into the Explorer or Coder.
+    orchestrator.resolve_placeholders(out.plan, answers, spec.app_url, bus)
     out.sitemap = explorer.explore(spec, out.plan, answers, bus)
     # Cross-stage validation before code generation
     orchestration_ok, orchestration_errors = orchestrator.validate_orchestration(
