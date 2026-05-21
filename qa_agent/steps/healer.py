@@ -11,7 +11,7 @@ from ..models import (
     GeneratedTest, PageSnapshot, RunResults, SiteMap, TestCase, TestPlan, TestSpec,
 )
 from ..prompts import HEALER_SYSTEM
-from .coder import _sanitize, _strip_fences
+from .coder import _post_process, _sanitize, _strip_fences
 from .explorer import _snapshot_page
 from playwright.sync_api import sync_playwright
 
@@ -123,4 +123,4 @@ def _rewrite(
         + f"\n\n# answers\n{json.dumps(answers, indent=2)}\n"
     )
     raw = text(HEALER_SYSTEM, prompt, temperature=0.1)
-    return _strip_fences(raw)
+    return _post_process(_strip_fences(raw))

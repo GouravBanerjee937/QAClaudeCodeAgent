@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import traceback
 from pathlib import Path
 
@@ -15,13 +16,39 @@ st.set_page_config(page_title="QA Autonomous Agent", page_icon="🧪", layout="w
 
 LEVEL_ICON = {"info": "•", "success": "✅", "warn": "⚠️", "error": "❌"}
 
+# Persist last-used inputs so users don't re-paste every session.
+_INPUTS_PATH = Path(__file__).parent / ".last_inputs.json"
+
+
+def _load_last_inputs() -> dict[str, str]:
+    if not _INPUTS_PATH.exists():
+        return {}
+    try:
+        return json.loads(_INPUTS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_last_inputs(app_url: str, user_story: str) -> None:
+    try:
+        _INPUTS_PATH.write_text(
+            json.dumps({"app_url": app_url, "user_story": user_story}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass  # persistence is best-effort; never block the pipeline
+
+
 if "phase" not in st.session_state:
+    saved = _load_last_inputs()
     st.session_state.phase = "input"
     st.session_state.events = []
     st.session_state.phase_a = None
     st.session_state.answers = {}
     st.session_state.phase_b = None
     st.session_state.error = None
+    st.session_state.app_url = saved.get("app_url", "")
+    st.session_state.user_story = saved.get("user_story", "")
 
 
 def reset() -> None:
@@ -95,6 +122,7 @@ if st.session_state.phase == "input":
         st.session_state.prd_text = prd_text
         st.session_state.app_url = app_url
         st.session_state.user_story = user_story
+        _save_last_inputs(app_url, user_story)
         st.session_state.phase = "phase_a"
         st.rerun()
 
@@ -186,7 +214,35 @@ if st.session_state.phase == "questions":
 # ─────────────────────────── PHASE: B (designer through reporter) ───────────────────────────
 if st.session_state.phase == "phase_b":
     bus = bus_for_session()
-    with st.status("Running pipeline (Designer → Reporter)…", expanded=True):
+
+    # Human-friendly step labels. The bus emits `step` as the agent name.
+    STEP_LABELS = {
+        "designer": "✍️ Designer — writing the test plan",
+        "explorer": "🔎 Explorer — visiting pages and scraping elements",
+        "orchestrator": "🧭 Orchestrator — cross-checking plan against reality",
+        "coder": "💻 Coder — generating pytest-playwright code",
+        "validator": "🧪 Validator — verifying locators",
+        "executor": "🚦 Executor — running pytest in a real browser",
+        "healer": "🩹 Healer — rewriting failing tests",
+        "reporter": "📝 Reporter — assembling the final report",
+    }
+
+    with st.status("🚀 Starting pipeline…", expanded=True) as status:
+        # Live mini-feed inside the status box.
+        feed = st.empty()
+        live_lines: list[str] = []
+
+        def live_sink(event: Event) -> None:
+            label = STEP_LABELS.get(event.step, event.step)
+            status.update(label=f"Currently: {label}")
+            ts = event.timestamp.strftime("%H:%M:%S")
+            icon = LEVEL_ICON.get(event.level, "•")
+            live_lines.append(f"`{ts}` {icon} **{event.step}** — {event.message}")
+            # Show the most recent ~25 lines so the box doesn't grow forever.
+            feed.markdown("\n\n".join(live_lines[-25:]))
+
+        bus.subscribe(live_sink)
+
         try:
             phase_b = pipeline.run_phase_b(
                 st.session_state.phase_a.spec, st.session_state.answers, bus,
@@ -196,6 +252,7 @@ if st.session_state.phase == "phase_b":
             st.session_state.phase = "error"
             st.rerun()
         else:
+            status.update(label="✅ Pipeline complete", state="complete")
             st.session_state.phase_b = phase_b
             st.session_state.phase = "done"
             st.rerun()

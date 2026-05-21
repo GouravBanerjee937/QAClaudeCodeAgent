@@ -29,6 +29,9 @@ test-results/
 reports/
 tests_generated/
 
+# Locally remembered inputs (last-used App URL + user story)
+.last_inputs.json
+
 # User specific saves
 saved_user_story.txt
 saved_user_story_multipage.txt

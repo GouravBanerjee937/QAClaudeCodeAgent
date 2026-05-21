@@ -84,6 +84,14 @@ class PageElement(BaseModel):
     role: str = Field(description="ARIA role, e.g. 'button', 'textbox', 'link'")
     name: str = Field(description="Accessible name, e.g. 'Sign in', 'Email address'")
     purpose: str = Field(description="LLM-inferred purpose, e.g. 'submit login form'")
+    container_id: str = Field(
+        default="",
+        description=(
+            "ID of the element's closest <form>, dialog, or section ancestor. "
+            "Used to disambiguate same-named fields across multiple forms in "
+            "the same DOM (e.g. SPAs that keep all routes' markup mounted)."
+        ),
+    )
 
 
 class PageSnapshot(BaseModel):

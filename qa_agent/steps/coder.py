@@ -28,12 +28,27 @@ def code(
         bus.emit("coder", f"Writing test for '{tc.id}'…")
         prompt = _build_prompt(spec, tc, sitemap, answers)
         raw = text(CODER_SYSTEM, prompt, temperature=0.1)
-        source = _strip_fences(raw)
+        source = _post_process(_strip_fences(raw))
         path = output_dir / f"test_{_sanitize(tc.id)}.py"
         path.write_text(source, encoding="utf-8")
         generated.append(GeneratedTest(test_case_id=tc.id, file_path=str(path), code=source))
         bus.emit("coder", f"  → wrote {path.name}", level="success")
     return generated
+
+
+# gpt-5 keeps writing `get_by_role("text", name="X", ...)` for status messages
+# even though "text" isn't a real ARIA role and Playwright will return nothing.
+# The right call is `get_by_text("X", exact=True)`. We auto-fix this here so the
+# generated code actually runs.
+_BAD_TEXT_ROLE_RE = re.compile(
+    r"""get_by_role\(\s*["']text["']\s*,\s*name\s*=\s*(["'][^"']+["'])\s*(?:,\s*exact\s*=\s*True\s*)?\)""",
+    re.VERBOSE,
+)
+
+
+def _post_process(source: str) -> str:
+    """Apply deterministic fixes to LLM-generated code before validation."""
+    return _BAD_TEXT_ROLE_RE.sub(lambda m: f"get_by_text({m.group(1)}, exact=True)", source)
 
 
 def resolve_url(app_url: str, path: str) -> str:
@@ -82,14 +97,18 @@ def _build_prompt(
 
 
 def _relevant_pages(tc: TestCase, sitemap: SiteMap) -> list[PageSnapshot]:
-    out: list[PageSnapshot] = []
-    for url in tc.page_urls:
-        snap = sitemap.pages.get(url)
-        if snap:
-            out.append(snap)
-    if not out:
-        out = list(sitemap.pages.values())
-    return out
+    """Return the entire SiteMap to the Coder.
+
+    Previously this tried to filter to only the URLs listed in `tc.page_urls`,
+    but SPA tests routinely touch elements from pages the test doesn't
+    explicitly visit — e.g. a nav link in the header, a status message that
+    appears on a different route, or a table row that exists on a page the
+    test merely passes through. Filtering at this layer was hiding that
+    content from the Coder and producing NEEDS markers for things that DID
+    exist in the SiteMap. The Coder's prompt instructs it to use only what
+    appears in the SiteMap, so handing it the full picture is safe.
+    """
+    return list(sitemap.pages.values())
 
 
 _FENCE_RE = re.compile(r"^```(?:python)?\s*|\s*```$", re.MULTILINE)
