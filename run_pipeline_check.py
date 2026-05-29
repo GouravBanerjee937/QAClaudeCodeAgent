@@ -1,10 +1,15 @@
 """Run the full QA pipeline end-to-end against the live Invoice App, with the
-user's Pencil-inventory PRD. No Streamlit — just calls into the library."""
+user's Pencil-inventory PRD. No Streamlit — just calls into the library.
+
+Pass --source to also fetch the GitHub repo and feed source insights into
+the Designer + Coder.
+"""
 from __future__ import annotations
 
 import sys
 from qa_agent import pipeline
 from qa_agent.events import EventBus, stdout_sink
+from qa_agent.source import fetch_source
 
 PRD = """Test that creating a sales invoice decrements the item quantity in Item Master.
 App URL: http://localhost:3000/#/login
@@ -19,7 +24,7 @@ App URL: http://localhost:3000/#/login
    the "Create Invoice" button.
 
 4. Fill the Create Invoice form:
-   - Invoice number: 11
+   - Invoice number: 12
    - Item name (select from dropdown): Pencil
    - Amount: 1
    - Price: 10
@@ -33,9 +38,22 @@ App URL: http://localhost:3000/#/login
 APP_URL = "http://localhost:3000/#/login"
 
 
+REPO_URL = "https://github.com/GouravBanerjee937/AccountingSoftware"
+
+
 def main() -> int:
+    use_source = "--source" in sys.argv
     bus = EventBus()
     bus.subscribe(stdout_sink)
+
+    source_insights = None
+    if use_source:
+        print("=" * 70)
+        print(f"SOURCE — fetching {REPO_URL}")
+        print("=" * 70)
+        source_insights = fetch_source(REPO_URL)
+        print(source_insights.summary())
+
     print("=" * 70)
     print("PHASE A — Analyst + Inquirer")
     print("=" * 70)
@@ -56,9 +74,12 @@ def main() -> int:
     print(f"\nAnswers: {answers}\n")
 
     print("=" * 70)
-    print("PHASE B — Designer → … → Reporter")
+    print("PHASE B — Designer → … → Reporter"
+          + (" (with source enrichment)" if source_insights else ""))
     print("=" * 70)
-    phase_b = pipeline.run_phase_b(phase_a.spec, answers, bus)
+    phase_b = pipeline.run_phase_b(
+        phase_a.spec, answers, bus, source_insights=source_insights,
+    )
 
     final = phase_b.final_results
     print()

@@ -29,10 +29,26 @@ def _load_last_inputs() -> dict[str, str]:
         return {}
 
 
-def _save_last_inputs(app_url: str, user_story: str) -> None:
+def _save_last_inputs(
+    app_url: str,
+    user_story: str,
+    *,
+    github_url: str = "",
+    use_source: bool = False,
+    enable_human: bool = False,
+) -> None:
     try:
         _INPUTS_PATH.write_text(
-            json.dumps({"app_url": app_url, "user_story": user_story}, indent=2),
+            json.dumps(
+                {
+                    "app_url": app_url,
+                    "user_story": user_story,
+                    "github_url": github_url,
+                    "use_source": use_source,
+                    "enable_human": enable_human,
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
     except Exception:
@@ -49,10 +65,20 @@ if "phase" not in st.session_state:
     st.session_state.error = None
     st.session_state.app_url = saved.get("app_url", "")
     st.session_state.user_story = saved.get("user_story", "")
+    st.session_state.github_url = saved.get("github_url", "")
+    st.session_state.use_source = saved.get("use_source", False)
+    st.session_state.source_insights = None
+    st.session_state.enable_human = saved.get("enable_human", False)
+    st.session_state.human_plan = None
+    st.session_state.human_sitemap = None
+    st.session_state.human_generated = None
 
 
 def reset() -> None:
-    for k in ("phase", "events", "phase_a", "answers", "phase_b", "error"):
+    for k in (
+        "phase", "events", "phase_a", "answers", "phase_b", "error",
+        "source_insights", "human_plan", "human_sitemap", "human_generated",
+    ):
         st.session_state.pop(k, None)
 
 
@@ -93,6 +119,39 @@ with st.sidebar:
         value=st.session_state.get("user_story", ""),
         placeholder="As a visitor on the homepage, I can click 'Pricing' and land on the pricing page…",
     )
+
+    with st.expander("🔗 Enhance with GitHub source (optional)", expanded=False):
+        st.caption(
+            "Paste a public GitHub repo URL of the app under test. The pipeline "
+            "will read its HTML/server source to use stable element IDs, known "
+            "routes, and API endpoints as a cheat-sheet. Leave this off for the "
+            "original behaviour."
+        )
+        github_url = st.text_input(
+            "GitHub repo URL",
+            placeholder="https://github.com/your-org/your-app",
+            value=st.session_state.get("github_url", ""),
+        )
+        use_source = st.checkbox(
+            "Use source code to enhance test quality",
+            value=st.session_state.get("use_source", False),
+            help=(
+                "When ON: shallow-clones the repo and feeds extracted IDs / routes "
+                "/ API endpoints to the Designer + Coder. When OFF: pipeline runs "
+                "exactly as before, untouched."
+            ),
+        )
+        enable_human = st.checkbox(
+            "🧑 Enable human-in-the-loop review",
+            value=st.session_state.get("enable_human", False),
+            help=(
+                "When ON: after the Designer writes the test plan, you approve / "
+                "modify / delete each test case. After the Coder writes Python "
+                "code, you can edit it before pytest runs. When OFF: the pipeline "
+                "runs autonomously, exactly as before."
+            ),
+        )
+
     st.divider()
     if st.button("Reset", use_container_width=True):
         reset()
@@ -122,7 +181,34 @@ if st.session_state.phase == "input":
         st.session_state.prd_text = prd_text
         st.session_state.app_url = app_url
         st.session_state.user_story = user_story
-        _save_last_inputs(app_url, user_story)
+        st.session_state.github_url = github_url
+        st.session_state.use_source = use_source
+        st.session_state.enable_human = enable_human
+        _save_last_inputs(
+            app_url, user_story, github_url=github_url, use_source=use_source,
+            enable_human=enable_human,
+        )
+
+        # Fetch source insights NOW (before Phase A) so they're ready by Phase B.
+        # Empty / off → source_insights stays None and the rest of the pipeline
+        # behaves exactly as the legacy flow.
+        st.session_state.source_insights = None
+        if use_source and github_url.strip():
+            from qa_agent.source import fetch_source
+            with st.spinner(f"Cloning {github_url} and reading source…"):
+                ins = fetch_source(github_url.strip())
+            if ins.is_empty:
+                st.warning(
+                    f"Source enrichment OFF for this run — {ins.notes or 'no useful content found in repo'}."
+                )
+            else:
+                st.session_state.source_insights = ins
+                st.success(
+                    f"Source loaded: {len(ins.stable_ids)} IDs · "
+                    f"{len(ins.routes)} routes · "
+                    f"{len(ins.api_endpoints)} API endpoint(s)."
+                )
+
         st.session_state.phase = "phase_a"
         st.rerun()
 
@@ -212,6 +298,11 @@ if st.session_state.phase == "questions":
 
 
 # ─────────────────────────── PHASE: B (designer through reporter) ───────────────────────────
+# Branch BEFORE the legacy phase_b runs so a human-mode session is fully isolated.
+if st.session_state.phase == "phase_b" and st.session_state.get("enable_human"):
+    st.session_state.phase = "human_design"
+    st.rerun()
+
 if st.session_state.phase == "phase_b":
     bus = bus_for_session()
 
@@ -246,6 +337,7 @@ if st.session_state.phase == "phase_b":
         try:
             phase_b = pipeline.run_phase_b(
                 st.session_state.phase_a.spec, st.session_state.answers, bus,
+                source_insights=st.session_state.get("source_insights"),
             )
         except Exception:
             st.session_state.error = traceback.format_exc()
@@ -467,3 +559,242 @@ if st.session_state.phase == "error":
     if st.button("Reset"):
         reset()
         st.rerun()
+
+
+# ──────────────────────── HUMAN-IN-THE-LOOP FLOW ────────────────────────
+# Everything below only fires when `enable_human` is on. The non-interactive
+# flow above doesn't touch any of this. Each phase is a small Streamlit screen
+# that pauses for review/edits before continuing.
+
+from qa_agent.steps import (
+    coder as _h_coder,
+    designer as _h_designer,
+    executor as _h_executor,
+    explorer as _h_explorer,
+    healer as _h_healer,
+    orchestrator as _h_orchestrator,
+    reporter as _h_reporter,
+    validator as _h_validator,
+)
+from qa_agent.models import TestPlan, TestCase, TestStep
+
+
+def _human_bus():
+    """Reuse the same Streamlit event sink used by the legacy flow."""
+    return bus_for_session()
+
+
+# Stage 1 — run Designer (and placeholder resolution), then hand to review.
+if st.session_state.phase == "human_design":
+    st.session_state.events = []
+    bus = _human_bus()
+    with st.status("✍️ Designer — writing the test plan…", expanded=True) as status:
+        try:
+            plan = _h_designer.design(
+                st.session_state.phase_a.spec, st.session_state.answers, bus,
+                source_insights=st.session_state.get("source_insights"),
+            )
+            _h_orchestrator.resolve_placeholders(
+                plan,
+                st.session_state.answers,
+                st.session_state.phase_a.spec.app_url,
+                bus,
+            )
+        except Exception:
+            st.session_state.error = traceback.format_exc()
+            st.session_state.phase = "error"
+            st.rerun()
+        else:
+            status.update(label=f"Designer drafted {len(plan.test_cases)} test case(s).", state="complete")
+            st.session_state.human_plan = plan
+            st.session_state.phase = "human_review_plan"
+            st.rerun()
+
+
+# Stage 2 — review / modify / delete each test case.
+if st.session_state.phase == "human_review_plan":
+    plan: TestPlan = st.session_state.human_plan
+    st.subheader("📋 Step 1 of 2 — Review the test plan")
+    st.caption(
+        "Untick any test case you don't want. Edit the title or expected outcome inline. "
+        "Click ▶ Continue when you're happy with the list."
+    )
+
+    keep_flags: list[bool] = []
+    titles: list[str] = []
+    outcomes: list[str] = []
+    for i, tc in enumerate(plan.test_cases):
+        with st.expander(f"`{tc.id}` — {tc.title}", expanded=False):
+            keep = st.checkbox("Keep this test", value=True, key=f"keep_{i}")
+            new_title = st.text_input("Title", value=tc.title, key=f"title_{i}")
+            new_outcome = st.text_area(
+                "Expected outcome", value=tc.expected_outcome, key=f"outcome_{i}", height=70,
+            )
+            st.markdown("**Steps** (read-only):")
+            steps_md = "\n".join([f"- **{s.keyword}** {s.text}" for s in tc.steps])
+            st.markdown(steps_md or "_(no steps)_")
+            urls_md = ", ".join([f"`{u}`" for u in tc.page_urls]) or "_(none)_"
+            st.caption(f"URLs: {urls_md}")
+        keep_flags.append(keep)
+        titles.append(new_title)
+        outcomes.append(new_outcome)
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("▶ Continue", type="primary"):
+            new_cases: list[TestCase] = []
+            for i, tc in enumerate(plan.test_cases):
+                if not keep_flags[i]:
+                    continue
+                new_cases.append(
+                    TestCase(
+                        id=tc.id,
+                        title=titles[i].strip() or tc.title,
+                        page_urls=tc.page_urls,
+                        steps=tc.steps,
+                        expected_outcome=outcomes[i].strip() or tc.expected_outcome,
+                    )
+                )
+            if not new_cases:
+                st.warning("You can't continue with zero test cases — keep at least one.")
+            else:
+                st.session_state.human_plan = TestPlan(test_cases=new_cases)
+                st.session_state.phase = "human_explore_code"
+                st.rerun()
+    with col2:
+        st.caption(f"Keeping {sum(keep_flags)} of {len(keep_flags)} test case(s).")
+    render_log()
+
+
+# Stage 3 — Explorer + Coder, then hand to code review.
+if st.session_state.phase == "human_explore_code":
+    bus = _human_bus()
+    spec = st.session_state.phase_a.spec
+    plan: TestPlan = st.session_state.human_plan
+    answers = st.session_state.answers
+    with st.status("🔎 Exploring + 💻 Writing code…", expanded=True) as status:
+        feed = st.empty()
+        lines: list[str] = []
+
+        def _sink(event: Event) -> None:
+            ts = event.timestamp.strftime("%H:%M:%S")
+            icon = LEVEL_ICON.get(event.level, "•")
+            lines.append(f"`{ts}` {icon} **{event.step}** — {event.message}")
+            feed.markdown("\n\n".join(lines[-25:]))
+            status.update(label=f"Currently: {event.step}")
+
+        bus.subscribe(_sink)
+        try:
+            sitemap = _h_explorer.explore(spec, plan, answers, bus)
+            _h_orchestrator.validate_orchestration(spec, plan, sitemap, bus)
+            generated = _h_coder.code(
+                spec, plan, sitemap, answers,
+                pipeline.TESTS_DIR, bus,
+                source_insights=st.session_state.get("source_insights"),
+            )
+        except Exception:
+            st.session_state.error = traceback.format_exc()
+            st.session_state.phase = "error"
+            st.rerun()
+        else:
+            status.update(label="Code drafted — ready for your review.", state="complete")
+            st.session_state.human_sitemap = sitemap
+            st.session_state.human_generated = generated
+            st.session_state.phase = "human_review_code"
+            st.rerun()
+
+
+# Stage 4 — review / edit each generated test file. Highlight NEEDS markers.
+if st.session_state.phase == "human_review_code":
+    st.subheader("📝 Step 2 of 2 — Review the generated code")
+    st.caption(
+        "Edit any test below before pytest runs. Click 📋 to copy. "
+        "If you see a `# NEEDS:` line, that's a spot the Coder couldn't figure out — "
+        "you can fix it manually here."
+    )
+    generated = st.session_state.human_generated
+    edited_sources: list[str] = []
+    for i, gt in enumerate(generated):
+        is_stub = "pytest.fail(" in gt.code or "# NEEDS:" in gt.code
+        marker = "⚠️ stub" if is_stub else "✅ ready"
+        with st.expander(f"{marker} — `{gt.test_case_id}` ({Path(gt.file_path).name})", expanded=is_stub):
+            new_src = st.text_area(
+                f"code_{i}",
+                value=gt.code,
+                height=320,
+                key=f"code_edit_{i}",
+                label_visibility="collapsed",
+            )
+            edited_sources.append(new_src)
+            st.code(new_src, language="python")  # gives a copy button via Streamlit's UI
+
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("▶ Run tests", type="primary"):
+            from qa_agent.steps.coder import _post_process  # apply same safety net
+            for gt, src in zip(generated, edited_sources):
+                final = _post_process(src)
+                Path(gt.file_path).write_text(final, encoding="utf-8")
+                gt.code = final
+            st.session_state.phase = "human_execute"
+            st.rerun()
+    with col2:
+        stubs = sum(1 for s in edited_sources if "pytest.fail(" in s or "# NEEDS:" in s)
+        if stubs:
+            st.warning(f"{stubs} of {len(edited_sources)} test(s) still contain stubs or NEEDS markers.")
+    render_log()
+
+
+# Stage 5 — Validator + Executor (+ optional Healer) + Reporter.
+if st.session_state.phase == "human_execute":
+    bus = _human_bus()
+    spec = st.session_state.phase_a.spec
+    plan: TestPlan = st.session_state.human_plan
+    sitemap = st.session_state.human_sitemap
+    answers = st.session_state.answers
+    generated = st.session_state.human_generated
+    with st.status("🚦 Running tests…", expanded=True) as status:
+        feed = st.empty()
+        lines: list[str] = []
+
+        def _sink2(event: Event) -> None:
+            ts = event.timestamp.strftime("%H:%M:%S")
+            icon = LEVEL_ICON.get(event.level, "•")
+            lines.append(f"`{ts}` {icon} **{event.step}** — {event.message}")
+            feed.markdown("\n\n".join(lines[-25:]))
+            status.update(label=f"Currently: {event.step}")
+
+        bus.subscribe(_sink2)
+        try:
+            generated, locator_reports = _h_validator.validate(generated, sitemap, bus)
+            initial = _h_executor.execute(generated, pipeline.TESTS_DIR, pipeline.REPORTS_DIR, bus)
+            results = initial
+            healed = generated
+            if initial.failed > 0:
+                healed, fresh_sitemap = _h_healer.heal(
+                    spec, plan, sitemap, generated, initial, answers, pipeline.TESTS_DIR, bus,
+                )
+                sitemap = fresh_sitemap
+                healed, locator_reports = _h_validator.validate(healed, sitemap, bus)
+                results = _h_executor.execute(healed, pipeline.TESTS_DIR, pipeline.REPORTS_DIR, bus)
+            report_md = _h_reporter.report(spec, plan, results, pipeline.REPORTS_DIR, bus)
+        except Exception:
+            st.session_state.error = traceback.format_exc()
+            st.session_state.phase = "error"
+            st.rerun()
+        else:
+            status.update(label="✅ Done.", state="complete")
+            # Reuse the existing PhaseB shape so the done-view works without changes.
+            pb = pipeline.PhaseB(
+                plan=plan,
+                sitemap=sitemap,
+                generated=generated,
+                locator_reports=locator_reports,
+                initial_results=initial,
+                healed_generated=healed,
+                final_results=results,
+                report_markdown=report_md,
+            )
+            st.session_state.phase_b = pb
+            st.session_state.phase = "done"
+            st.rerun()

@@ -11,6 +11,7 @@ from ..events import EventBus
 from ..llm import text
 from ..models import GeneratedTest, PageSnapshot, SiteMap, TestCase, TestPlan, TestSpec
 from ..prompts import CODER_SYSTEM
+from ..source import SourceInsights, render_hints_for_prompt
 
 
 def code(
@@ -20,13 +21,18 @@ def code(
     answers: dict[str, str],
     output_dir: Path,
     bus: EventBus,
+    *,
+    source_insights: SourceInsights | None = None,
 ) -> list[GeneratedTest]:
     output_dir.mkdir(parents=True, exist_ok=True)
     _clear_dir(output_dir)
+    source_hints = render_hints_for_prompt(source_insights) if source_insights else ""
     generated: list[GeneratedTest] = []
     for tc in plan.test_cases:
         bus.emit("coder", f"Writing test for '{tc.id}'…")
         prompt = _build_prompt(spec, tc, sitemap, answers)
+        if source_hints:
+            prompt = prompt + "\n\n" + source_hints
         raw = text(CODER_SYSTEM, prompt, temperature=0.1)
         source = _post_process(_strip_fences(raw))
         path = output_dir / f"test_{_sanitize(tc.id)}.py"

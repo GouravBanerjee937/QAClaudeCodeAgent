@@ -67,6 +67,14 @@ from the Explorer's live DOM scrape, not from the user.
 DESIGNER_SYSTEM = """You are a senior test engineer. Given a TestSpec and a dict of \
 user-provided answers, produce a focused TestPlan covering the spec's acceptance criteria.
 
+If the prompt ends with a `# Source-derived hints` section listing routes, IDs and \
+API endpoints, you may:
+  - Trust the listed routes as the app's full URL space (no need to invent paths).
+  - Reference the API endpoints in test-case `expected_outcome` text when a test \
+    should verify state persisted to the backend (e.g. "...and a GET /api/items \
+    response shows the Pencil row qty decreased by 1"). The Coder will translate.
+Without that section, ignore this clause and behave exactly as the base rules say.
+
 Rules:
 - Generate ONE TestCase per acceptance criterion. Cover the full flow end-to-end in that \
 one test (e.g. a "user can log in" test types email, types password, clicks the button, \
@@ -110,6 +118,21 @@ Do not invent elements. Use the exact role and name as given.
 CODER_SYSTEM = """You are a Playwright test author. Write a single pytest-playwright \
 test function for the given TestCase, using ONLY the page elements provided in the SiteMap \
 and ONLY the values provided in the answers dict.
+
+If the user provides a `# Source-derived hints` section AT THE END of the prompt, treat \
+it as a supplementary cheat sheet:
+  • Prefer role-based + SiteMap locators as your primary strategy (rules 5–6).
+  • Use the source-listed stable HTML IDs ONLY as a TIE-BREAKER when role-based \
+    locators are ambiguous or missing — e.g. `page.locator("#invoice-amount")`.
+  • The source's API endpoints can be used to write ADDITIONAL backend assertions \
+    when the TestCase's expected_outcome talks about persistence or state changes \
+    that the UI alone can't verify. Use Python's `requests` module via `import \
+    requests` (it is available). Keep API assertions concise — a quick GET to \
+    confirm the resource was created or updated, then assert on the response JSON.
+  • The source-listed routes confirm that hash-based or path-based navigation is \
+    available — do not invent routes not in either the SiteMap or the source list.
+If no `# Source-derived hints` section is present, behave exactly as the base rules \
+specify and ignore this clause.
 
 Hard rules:
 1. Output a complete Python file. No prose, no markdown fences. Just code.

@@ -13,6 +13,7 @@ from .events import EventBus
 from .models import (
     GeneratedTest, LocatorReport, Questions, RunResults, SiteMap, TestPlan, TestSpec,
 )
+from .source import SourceInsights
 from .steps import (
     analyst, coder, designer, executor, explorer, healer, inquirer, orchestrator,
     reporter, validator,
@@ -53,9 +54,12 @@ def run_phase_b(
     bus: EventBus,
     *,
     heal_failures: bool = True,
+    source_insights: SourceInsights | None = None,
 ) -> PhaseB:
     out = PhaseB()
-    out.plan = designer.design(spec, answers, bus)
+    if source_insights and not source_insights.is_empty:
+        bus.emit("source", source_insights.summary().replace("\n", " | "), level="info")
+    out.plan = designer.design(spec, answers, bus, source_insights=source_insights)
     # Resolve any `{key}` placeholders the Designer baked into URLs, so we don't
     # send literal "{login-url}" strings into the Explorer or Coder.
     orchestrator.resolve_placeholders(out.plan, answers, spec.app_url, bus)
@@ -70,7 +74,10 @@ def run_phase_b(
             "Cannot proceed with code generation due to validation errors",
             level="error",
         )
-    out.generated = coder.code(spec, out.plan, out.sitemap, answers, TESTS_DIR, bus)
+    out.generated = coder.code(
+        spec, out.plan, out.sitemap, answers, TESTS_DIR, bus,
+        source_insights=source_insights,
+    )
     out.generated, out.locator_reports = validator.validate(out.generated, out.sitemap, bus)
     out.initial_results = executor.execute(out.generated, TESTS_DIR, REPORTS_DIR, bus)
 
