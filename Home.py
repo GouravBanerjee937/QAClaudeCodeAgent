@@ -16,6 +16,18 @@ st.set_page_config(page_title="QA Autonomous Agent", page_icon="🧪", layout="w
 
 LEVEL_ICON = {"info": "•", "success": "✅", "warn": "⚠️", "error": "❌"}
 
+# Human-friendly step labels. The bus emits `step` as the agent name.
+STEP_LABELS = {
+    "designer": "✍️ Designer — writing the test plan",
+    "explorer": "🔎 Explorer — visiting pages and scraping elements",
+    "orchestrator": "🧭 Orchestrator — cross-checking plan against reality",
+    "coder": "💻 Coder — generating pytest-playwright code",
+    "validator": "🧪 Validator — verifying locators",
+    "executor": "🚦 Executor — running pytest in a real browser",
+    "healer": "🩹 Healer — rewriting failing tests",
+    "reporter": "📝 Reporter — assembling the final report",
+}
+
 # Persist last-used inputs so users don't re-paste every session.
 _INPUTS_PATH = Path(__file__).parent / ".last_inputs.json"
 
@@ -72,12 +84,15 @@ if "phase" not in st.session_state:
     st.session_state.human_plan = None
     st.session_state.human_sitemap = None
     st.session_state.human_generated = None
+    st.session_state.phase_b_partial = None
+    st.session_state.url_problems = []
 
 
 def reset() -> None:
     for k in (
         "phase", "events", "phase_a", "answers", "phase_b", "error",
         "source_insights", "human_plan", "human_sitemap", "human_generated",
+        "phase_b_partial", "url_problems",
     ):
         st.session_state.pop(k, None)
 
@@ -303,40 +318,127 @@ if st.session_state.phase == "phase_b" and st.session_state.get("enable_human"):
     st.session_state.phase = "human_design"
     st.rerun()
 
+def _attach_live_feed(bus: "EventBus", status) -> None:
+    """Wire a status box's label + a rolling mini-feed to bus events."""
+    feed = st.empty()
+    live_lines: list[str] = []
+
+    def live_sink(event: Event) -> None:
+        label = STEP_LABELS.get(event.step, event.step)
+        status.update(label=f"Currently: {label}")
+        ts = event.timestamp.strftime("%H:%M:%S")
+        icon = LEVEL_ICON.get(event.level, "•")
+        live_lines.append(f"`{ts}` {icon} **{event.step}** — {event.message}")
+        feed.markdown("\n\n".join(live_lines[-25:]))
+
+    bus.subscribe(live_sink)
+
+
+# Stage B1 — Designer + Explorer, then check whether every planned URL was
+# actually reachable. If any weren't, we PAUSE and ask the user — never guess.
 if st.session_state.phase == "phase_b":
+    st.session_state.events = []
     bus = bus_for_session()
-
-    # Human-friendly step labels. The bus emits `step` as the agent name.
-    STEP_LABELS = {
-        "designer": "✍️ Designer — writing the test plan",
-        "explorer": "🔎 Explorer — visiting pages and scraping elements",
-        "orchestrator": "🧭 Orchestrator — cross-checking plan against reality",
-        "coder": "💻 Coder — generating pytest-playwright code",
-        "validator": "🧪 Validator — verifying locators",
-        "executor": "🚦 Executor — running pytest in a real browser",
-        "healer": "🩹 Healer — rewriting failing tests",
-        "reporter": "📝 Reporter — assembling the final report",
-    }
-
-    with st.status("🚀 Starting pipeline…", expanded=True) as status:
-        # Live mini-feed inside the status box.
-        feed = st.empty()
-        live_lines: list[str] = []
-
-        def live_sink(event: Event) -> None:
-            label = STEP_LABELS.get(event.step, event.step)
-            status.update(label=f"Currently: {label}")
-            ts = event.timestamp.strftime("%H:%M:%S")
-            icon = LEVEL_ICON.get(event.level, "•")
-            live_lines.append(f"`{ts}` {icon} **{event.step}** — {event.message}")
-            # Show the most recent ~25 lines so the box doesn't grow forever.
-            feed.markdown("\n\n".join(live_lines[-25:]))
-
-        bus.subscribe(live_sink)
-
+    with st.status("🚀 Designing tests & exploring the site…", expanded=True) as status:
+        _attach_live_feed(bus, status)
         try:
-            phase_b = pipeline.run_phase_b(
+            partial = pipeline.run_phase_b_explore(
                 st.session_state.phase_a.spec, st.session_state.answers, bus,
+                source_insights=st.session_state.get("source_insights"),
+            )
+        except Exception:
+            st.session_state.error = traceback.format_exc()
+            st.session_state.phase = "error"
+            st.rerun()
+        else:
+            st.session_state.phase_b_partial = partial
+            problems = pipeline.unreachable_urls(
+                st.session_state.phase_a.spec, partial.plan, partial.sitemap,
+            )
+            if problems:
+                st.session_state.url_problems = problems
+                status.update(
+                    label=f"⏸ {len(problems)} URL(s) need your confirmation",
+                    state="complete",
+                )
+                st.session_state.phase = "verify_urls"
+            else:
+                status.update(label="✅ Exploration complete", state="complete")
+                st.session_state.phase = "phase_b_finish"
+            st.rerun()
+
+
+# Stage B1.5 — pause: the Explorer couldn't reach some URLs. Ask the user.
+if st.session_state.phase == "verify_urls":
+    problems = st.session_state.get("url_problems", [])
+    st.subheader("🛑 Confirm these URLs — I won't guess")
+    st.caption(
+        "The Explorer couldn't load a usable page for the URL(s) below (the page "
+        "was missing, or returned no interactable elements). Enter the correct URL "
+        "for each. My best guess is pre-filled as a suggestion — change it if it's wrong."
+    )
+    with st.form("verify_urls_form"):
+        corrections: dict[str, str] = {}
+        for i, p in enumerate(problems):
+            st.markdown(f"**Test `{p['test_case_id']}`** needs a page it couldn't reach.")
+            st.caption(f"Planned URL that failed: `{p['url']}`")
+            corrections[f"{p['test_case_id']}::{p['url']}"] = st.text_input(
+                "Correct URL",
+                value=p["suggestion"],
+                key=f"url_fix_{i}",
+                help="Suggestion pre-filled from my best guess — edit if it's wrong.",
+            )
+            st.divider()
+        submitted = st.form_submit_button("▶ Use these URLs & continue", type="primary")
+
+    if submitted:
+        partial = st.session_state.phase_b_partial
+        # Patch the failed URLs in the plan with the user's corrections.
+        for tc in partial.plan.test_cases:
+            tc.page_urls = [
+                corrections.get(f"{tc.id}::{u}", u) for u in tc.page_urls
+            ]
+        # Re-explore (Explorer only — no re-design) with the corrected URLs.
+        st.session_state.events = []
+        bus = bus_for_session()
+        with st.status("🔎 Re-exploring with your URLs…", expanded=True) as status:
+            _attach_live_feed(bus, status)
+            try:
+                partial.sitemap = pipeline.explore_only(
+                    st.session_state.phase_a.spec, partial.plan,
+                    st.session_state.answers, bus,
+                )
+            except Exception:
+                st.session_state.error = traceback.format_exc()
+                st.session_state.phase = "error"
+                st.rerun()
+            else:
+                status.update(label="✅ Re-exploration complete", state="complete")
+        st.session_state.phase_b_partial = partial
+        remaining = pipeline.unreachable_urls(
+            st.session_state.phase_a.spec, partial.plan, partial.sitemap,
+        )
+        if remaining:
+            st.session_state.url_problems = remaining
+            st.warning(
+                "Some URLs still couldn't be reached — please correct them and try again."
+            )
+            st.rerun()
+        else:
+            st.session_state.phase = "phase_b_finish"
+            st.rerun()
+    render_log()
+
+
+# Stage B2 — Orchestrator → Coder → Validator → Executor → Healer → Reporter.
+if st.session_state.phase == "phase_b_finish":
+    bus = bus_for_session()
+    with st.status("🚀 Building & running tests…", expanded=True) as status:
+        _attach_live_feed(bus, status)
+        try:
+            phase_b = pipeline.run_phase_b_finish(
+                st.session_state.phase_a.spec, st.session_state.answers,
+                st.session_state.phase_b_partial, bus,
                 source_insights=st.session_state.get("source_insights"),
             )
         except Exception:
@@ -666,26 +768,108 @@ if st.session_state.phase == "human_review_plan":
     render_log()
 
 
-# Stage 3 — Explorer + Coder, then hand to code review.
+# Stage 3 — Explorer (only). Then check URL reachability; pause if any failed.
 if st.session_state.phase == "human_explore_code":
     bus = _human_bus()
     spec = st.session_state.phase_a.spec
     plan: TestPlan = st.session_state.human_plan
     answers = st.session_state.answers
-    with st.status("🔎 Exploring + 💻 Writing code…", expanded=True) as status:
-        feed = st.empty()
-        lines: list[str] = []
-
-        def _sink(event: Event) -> None:
-            ts = event.timestamp.strftime("%H:%M:%S")
-            icon = LEVEL_ICON.get(event.level, "•")
-            lines.append(f"`{ts}` {icon} **{event.step}** — {event.message}")
-            feed.markdown("\n\n".join(lines[-25:]))
-            status.update(label=f"Currently: {event.step}")
-
-        bus.subscribe(_sink)
+    st.session_state.events = []
+    with st.status("🔎 Exploring the site…", expanded=True) as status:
+        _attach_live_feed(bus, status)
         try:
             sitemap = _h_explorer.explore(spec, plan, answers, bus)
+        except Exception:
+            st.session_state.error = traceback.format_exc()
+            st.session_state.phase = "error"
+            st.rerun()
+        else:
+            st.session_state.human_sitemap = sitemap
+            problems = pipeline.unreachable_urls(spec, plan, sitemap)
+            if problems:
+                st.session_state.url_problems = problems
+                status.update(
+                    label=f"⏸ {len(problems)} URL(s) need your confirmation",
+                    state="complete",
+                )
+                st.session_state.phase = "human_verify_urls"
+            else:
+                status.update(label="✅ Exploration complete", state="complete")
+                st.session_state.phase = "human_code"
+            st.rerun()
+
+
+# Stage 3.5 — pause: ask the user to confirm URLs the Explorer couldn't reach.
+if st.session_state.phase == "human_verify_urls":
+    problems = st.session_state.get("url_problems", [])
+    st.subheader("🛑 Confirm these URLs — I won't guess")
+    st.caption(
+        "The Explorer couldn't load a usable page for the URL(s) below (the page was "
+        "missing, or returned no interactable elements). Enter the correct URL for each. "
+        "My best guess is pre-filled as a suggestion — change it if it's wrong."
+    )
+    with st.form("human_verify_urls_form"):
+        corrections: dict[str, str] = {}
+        for i, p in enumerate(problems):
+            st.markdown(f"**Test `{p['test_case_id']}`** needs a page it couldn't reach.")
+            st.caption(f"Planned URL that failed: `{p['url']}`")
+            corrections[f"{p['test_case_id']}::{p['url']}"] = st.text_input(
+                "Correct URL",
+                value=p["suggestion"],
+                key=f"h_url_fix_{i}",
+                help="Suggestion pre-filled from my best guess — edit if it's wrong.",
+            )
+            st.divider()
+        submitted = st.form_submit_button("▶ Use these URLs & continue", type="primary")
+
+    if submitted:
+        spec = st.session_state.phase_a.spec
+        plan = st.session_state.human_plan
+        # Patch the failed URLs in the plan with the user's corrections.
+        for tc in plan.test_cases:
+            tc.page_urls = [
+                corrections.get(f"{tc.id}::{u}", u) for u in tc.page_urls
+            ]
+        st.session_state.human_plan = plan
+        st.session_state.events = []
+        bus = _human_bus()
+        with st.status("🔎 Re-exploring with your URLs…", expanded=True) as status:
+            _attach_live_feed(bus, status)
+            try:
+                sitemap = pipeline.explore_only(
+                    spec, plan, st.session_state.answers, bus,
+                )
+            except Exception:
+                st.session_state.error = traceback.format_exc()
+                st.session_state.phase = "error"
+                st.rerun()
+            else:
+                status.update(label="✅ Re-exploration complete", state="complete")
+        st.session_state.human_sitemap = sitemap
+        remaining = pipeline.unreachable_urls(spec, plan, sitemap)
+        if remaining:
+            st.session_state.url_problems = remaining
+            st.warning(
+                "Some URLs still couldn't be reached — please correct them and try again."
+            )
+            st.rerun()
+        else:
+            st.session_state.phase = "human_code"
+            st.rerun()
+    render_log()
+
+
+# Stage 3.6 — Orchestrator validate + Coder, then hand to code review.
+if st.session_state.phase == "human_code":
+    bus = _human_bus()
+    spec = st.session_state.phase_a.spec
+    plan: TestPlan = st.session_state.human_plan
+    sitemap = st.session_state.human_sitemap
+    answers = st.session_state.answers
+    st.session_state.events = []
+    with st.status("💻 Writing code…", expanded=True) as status:
+        _attach_live_feed(bus, status)
+        try:
             _h_orchestrator.validate_orchestration(spec, plan, sitemap, bus)
             generated = _h_coder.code(
                 spec, plan, sitemap, answers,
@@ -698,7 +882,6 @@ if st.session_state.phase == "human_explore_code":
             st.rerun()
         else:
             status.update(label="Code drafted — ready for your review.", state="complete")
-            st.session_state.human_sitemap = sitemap
             st.session_state.human_generated = generated
             st.session_state.phase = "human_review_code"
             st.rerun()
