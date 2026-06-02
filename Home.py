@@ -9,6 +9,7 @@ from pathlib import Path
 import streamlit as st
 
 from qa_agent import pipeline, prd
+from qa_agent.datasets import validate as dataset_validate
 from qa_agent.events import Event, EventBus
 from qa_agent.models import Question
 
@@ -32,7 +33,7 @@ STEP_LABELS = {
 _INPUTS_PATH = Path(__file__).parent / ".last_inputs.json"
 
 
-def _load_last_inputs() -> dict[str, str]:
+def _load_last_inputs() -> dict:
     if not _INPUTS_PATH.exists():
         return {}
     try:
@@ -48,6 +49,7 @@ def _save_last_inputs(
     github_url: str = "",
     use_source: bool = False,
     enable_human: bool = False,
+    datasets: dict[str, list[str]] | None = None,
 ) -> None:
     try:
         _INPUTS_PATH.write_text(
@@ -58,6 +60,7 @@ def _save_last_inputs(
                     "github_url": github_url,
                     "use_source": use_source,
                     "enable_human": enable_human,
+                    "datasets": datasets or {},
                 },
                 indent=2,
             ),
@@ -86,6 +89,24 @@ if "phase" not in st.session_state:
     st.session_state.human_generated = None
     st.session_state.phase_b_partial = None
     st.session_state.url_problems = []
+    # Dataset variables: editor rows are [{"name": str, "values": "<newline text>"}].
+    saved_ds = saved.get("datasets") or {}
+    st.session_state.dataset_rows = [
+        {"name": name, "values": "\n".join(vals)} for name, vals in saved_ds.items()
+    ] or [{"name": "", "values": ""}]
+
+
+def _rows_to_datasets(rows: list[dict]) -> dict[str, list[str]]:
+    """Editor rows → {name: [values]}, skipping blank names and blank values."""
+    out: dict[str, list[str]] = {}
+    for row in rows:
+        name = (row.get("name") or "").strip()
+        if not name:
+            continue
+        values = [v.strip() for v in (row.get("values") or "").splitlines() if v.strip()]
+        if values:
+            out[name] = values
+    return out
 
 
 def reset() -> None:
@@ -197,6 +218,46 @@ with st.sidebar:
             ),
         )
 
+    with st.expander("🧮 Dataset variables (optional)", expanded=False):
+        st.caption(
+            "Define a variable and give it one value per line. Reference it in your "
+            "PRD with double braces, e.g. `{{username}}`. If a variable has 3 values, "
+            "every test that uses it runs 3 times — once per value. Multiple variables "
+            "in the same test are paired row-by-row (value 1 with value 1, …)."
+        )
+        rows = st.session_state.dataset_rows
+        for i, row in enumerate(rows):
+            c1, c2 = st.columns([2, 1])
+            row["name"] = c1.text_input(
+                "Variable name", value=row.get("name", ""),
+                key=f"ds_name_{i}", placeholder="username",
+            )
+            if c2.button("🗑️", key=f"ds_del_{i}", help="Remove this variable"):
+                rows.pop(i)
+                if not rows:
+                    rows.append({"name": "", "values": ""})
+                st.rerun()
+            row["values"] = st.text_area(
+                "Values (one per line)", value=row.get("values", ""),
+                key=f"ds_vals_{i}", height=80,
+                placeholder="alice\nbob\ncarol",
+                label_visibility="collapsed",
+            )
+        if st.button("➕ Add variable", use_container_width=True):
+            rows.append({"name": "", "values": ""})
+            st.rerun()
+
+        _ds_preview = _rows_to_datasets(rows)
+        _ds_problems = dataset_validate(_ds_preview)
+        if _ds_problems:
+            for p in _ds_problems:
+                st.warning(p)
+        elif _ds_preview:
+            st.success(
+                "Datasets: "
+                + ", ".join(f"{k} ({len(v)})" for k, v in _ds_preview.items())
+            )
+
     st.divider()
     if st.button("Reset", use_container_width=True):
         reset()
@@ -223,15 +284,22 @@ if st.session_state.phase == "input":
             st.warning("Enter the App URL.")
             st.stop()
 
+        datasets = _rows_to_datasets(st.session_state.dataset_rows)
+        ds_problems = dataset_validate(datasets)
+        if ds_problems:
+            st.error("Fix the dataset variables before running:\n\n- " + "\n- ".join(ds_problems))
+            st.stop()
+
         st.session_state.prd_text = prd_text
         st.session_state.app_url = app_url
         st.session_state.user_story = user_story
         st.session_state.github_url = github_url
         st.session_state.use_source = use_source
         st.session_state.enable_human = enable_human
+        st.session_state.datasets = datasets
         _save_last_inputs(
             app_url, user_story, github_url=github_url, use_source=use_source,
-            enable_human=enable_human,
+            enable_human=enable_human, datasets=datasets,
         )
 
         # Fetch source insights NOW (before Phase A) so they're ready by Phase B.
@@ -267,6 +335,7 @@ if st.session_state.phase == "phase_a":
             phase_a = pipeline.run_phase_a(
                 st.session_state.prd_text, st.session_state.app_url, bus,
                 source_insights=st.session_state.get("source_insights"),
+                datasets=st.session_state.get("datasets"),
             )
         except Exception as exc:
             st.session_state.error = traceback.format_exc()
@@ -532,6 +601,7 @@ if st.session_state.phase == "phase_b_finish":
                 st.session_state.phase_a.spec, st.session_state.answers,
                 st.session_state.phase_b_partial, bus,
                 source_insights=st.session_state.get("source_insights"),
+                datasets=st.session_state.get("datasets"),
             )
         except Exception:
             st.session_state.error = traceback.format_exc()
@@ -967,6 +1037,7 @@ if st.session_state.phase == "human_code":
                 spec, plan, sitemap, answers,
                 pipeline.TESTS_DIR, bus,
                 source_insights=st.session_state.get("source_insights"),
+                datasets=st.session_state.get("datasets"),
             )
         except Exception:
             st.session_state.error = traceback.format_exc()

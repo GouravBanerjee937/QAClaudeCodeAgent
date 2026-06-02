@@ -203,6 +203,12 @@ def _check_one(call: ast.Call, index: dict[str, set[str]]) -> LocatorCheck | Non
         args_text = f'role={role!r}, name={name!r}' if name else f'role={role!r}'
         if not role:
             return None
+        # get_by_role("cell") with no name is always chained from a row locator
+        # (e.g. row.get_by_role("cell").nth(N)) — Playwright finds <td>/<gridcell>
+        # natively. Never flag it as a miss; the Coder prompt already documents
+        # this as an allowed exception.
+        if role == "cell" and name is None:
+            return LocatorCheck(method=method, args=args_text, status="match")
         return _match("get_by_role", args_text, role, name, index)
     if method in ("get_by_text", "get_by_label", "get_by_placeholder", "get_by_title", "get_by_alt_text"):
         value = _literal_arg(call, 0)

@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 
+from ..datasets import apply_datasets
 from ..events import EventBus
 from ..llm import text
 from ..models import GeneratedTest, PageSnapshot, SiteMap, TestCase, TestPlan, TestSpec
@@ -23,6 +24,7 @@ def code(
     bus: EventBus,
     *,
     source_insights: SourceInsights | None = None,
+    datasets: dict[str, list[str]] | None = None,
 ) -> list[GeneratedTest]:
     output_dir.mkdir(parents=True, exist_ok=True)
     _clear_dir(output_dir)
@@ -30,11 +32,15 @@ def code(
     generated: list[GeneratedTest] = []
     for tc in plan.test_cases:
         bus.emit("coder", f"Writing test for '{tc.id}'…")
-        prompt = _build_prompt(spec, tc, sitemap, answers)
+        prompt = _build_prompt(spec, tc, sitemap, answers, datasets)
         if source_hints:
             prompt = prompt + "\n\n" + source_hints
         raw = text(CODER_SYSTEM, prompt, temperature=0.1)
         source = _post_process(_strip_fences(raw))
+        source = apply_datasets(
+            source, datasets,
+            on_warn=lambda msg: bus.emit("coder", msg, level="warn"),
+        )
         path = output_dir / f"test_{_sanitize(tc.id)}.py"
         path.write_text(source, encoding="utf-8")
         generated.append(GeneratedTest(test_case_id=tc.id, file_path=str(path), code=source))
@@ -63,6 +69,13 @@ _CHK_RAD_FILL_RE = re.compile(
 _BTN_LNK_FILL_RE = re.compile(
     r"""(get_by_role\(\s*["'](?:button|link)["'][^)]*\))\.fill\([^)]*\)""",
 )
+# Rule: table rows must be located with .filter(has_text=...) not name=.
+# get_by_role("row", name="X") → get_by_role("row").filter(has_text="X")
+# because a row's accessible name in the DOM is its full concatenated cell text,
+# not just the first cell — so name= never matches at runtime.
+_ROW_NAME_RE = re.compile(
+    r"""get_by_role\(\s*["']row["']\s*,\s*name\s*=\s*(["'])([^"']+)\1[^)]*\)""",
+)
 
 
 def _post_process(source: str) -> str:
@@ -75,6 +88,9 @@ def _post_process(source: str) -> str:
     s = _COMBOBOX_FILL_RE.sub(r"\1.select_option(", s)
     s = _CHK_RAD_FILL_RE.sub(r"\1.check()", s)
     s = _BTN_LNK_FILL_RE.sub(r"\1.click()", s)
+    s = _ROW_NAME_RE.sub(
+        lambda m: f'get_by_role("row").filter(has_text="{m.group(2)}")', s
+    )
     return s
 
 
@@ -97,7 +113,11 @@ def resolve_url(app_url: str, path: str) -> str:
 
 
 def _build_prompt(
-    spec: TestSpec, tc: TestCase, sitemap: SiteMap, answers: dict[str, str]
+    spec: TestSpec,
+    tc: TestCase,
+    sitemap: SiteMap,
+    answers: dict[str, str],
+    datasets: dict[str, list[str]] | None = None,
 ) -> str:
     snapshots = _relevant_pages(tc, sitemap)
     resolved = {u: resolve_url(spec.app_url, u) for u in tc.page_urls}
@@ -112,8 +132,17 @@ def _build_prompt(
         f"# answers (substitute {{key}} references in steps with these)\n"
         f"{json.dumps(answers, indent=2)}",
         "",
-        "# SiteMap — allowed elements (use these EXACT role+name strings)",
     ]
+    if datasets:
+        parts.extend([
+            "# dataset_variables — wherever one of these values is needed, write the "
+            "token EXACTLY as {{name}} (double curly braces) inside a normal string "
+            "literal, e.g. .fill(\"{{username}}\"). Do NOT substitute a real value or "
+            "use single braces; parametrization fills them in afterwards.\n"
+            f"{json.dumps(sorted(datasets.keys()), indent=2)}",
+            "",
+        ])
+    parts.append("# SiteMap — allowed elements (use these EXACT role+name strings)")
     for snap in snapshots:
         parts.append(f"\n## Page: {snap.url}  (title: {snap.title!r})")
         if not snap.elements:

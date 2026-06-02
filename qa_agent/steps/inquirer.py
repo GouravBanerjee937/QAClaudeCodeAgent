@@ -16,6 +16,7 @@ def inquire(
     bus: EventBus,
     *,
     source_insights: SourceInsights | None = None,
+    datasets: dict[str, list[str]] | None = None,
 ) -> Questions:
     bus.emit("inquirer", "Checking what concrete values are missing from the PRD…")
     payload = spec.model_dump_json(indent=2)
@@ -38,6 +39,16 @@ def inquire(
             f"Dropped {before - after} URL question(s) — already covered by PRD/GitHub.",
             level="info",
         )
+    # Deterministic post-filter: never ask for a value the user supplies via a
+    # dataset variable ({{name}} tokens). Their values come from the dataset.
+    before = len(questions.items)
+    questions = _drop_dataset_questions(questions, datasets)
+    if before > len(questions.items):
+        bus.emit(
+            "inquirer",
+            f"Dropped {before - len(questions.items)} question(s) — supplied by datasets.",
+            level="info",
+        )
     if not questions.items:
         bus.emit("inquirer", "Spec is complete. No questions for you.", level="success")
     else:
@@ -49,6 +60,29 @@ def inquire(
         for q in questions.items:
             bus.emit("inquirer", f"  • {q.key} — {q.prompt}")
     return questions
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _drop_dataset_questions(
+    questions: Questions, datasets: dict[str, list[str]] | None,
+) -> Questions:
+    """Remove questions whose key overlaps a user-defined dataset variable name.
+
+    Uses substring matching so that a dataset variable 'username' covers a
+    question keyed 'login-username' (and vice-versa).
+    """
+    if not datasets:
+        return questions
+    ds_names = {_norm(n) for n in datasets}
+
+    def _covered(q) -> bool:
+        qn = _norm(q.key)
+        return any(dn in qn or qn in dn for dn in ds_names)
+
+    return Questions(items=[q for q in questions.items if not _covered(q)])
 
 
 _APP_URL_PHRASES = (

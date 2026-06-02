@@ -413,7 +413,16 @@ def _scrape_elements(page: Page) -> list[dict[str, str]]:
       ).forEach((el) => {
         const role = roleAttr(el) || implicit(el);
         if (!role) return;
-        const n = name(el);
+        // For ARIA row elements (div-based tables used by React apps), use the
+        // first cell child's text as the name — not the full concatenated row text.
+        let n = name(el);
+        if (role === 'row') {
+          const firstCell = el.querySelector('[role="cell"], [role="gridcell"], td');
+          if (firstCell) {
+            const cellText = (firstCell.innerText || firstCell.textContent || '').trim();
+            if (cellText && cellText.length < 100) n = cellText;
+          }
+        }
         if (!n) return;
         const cid = containerId(el);
         const key = role + '::' + n + '::' + cid;

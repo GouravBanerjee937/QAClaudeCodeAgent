@@ -48,9 +48,12 @@ def run_phase_a(
     bus: EventBus,
     *,
     source_insights: SourceInsights | None = None,
+    datasets: dict[str, list[str]] | None = None,
 ) -> PhaseA:
     spec = analyst.analyze(prd_text, app_url, bus, source_insights=source_insights)
-    questions = inquirer.inquire(spec, bus, source_insights=source_insights)
+    questions = inquirer.inquire(
+        spec, bus, source_insights=source_insights, datasets=datasets,
+    )
     return PhaseA(spec=spec, questions=questions)
 
 
@@ -211,6 +214,7 @@ def run_phase_b_finish(
     *,
     heal_failures: bool = True,
     source_insights: SourceInsights | None = None,
+    datasets: dict[str, list[str]] | None = None,
 ) -> PhaseB:
     """Second half of Phase B: validate, generate code, run, heal, report.
 
@@ -230,7 +234,7 @@ def run_phase_b_finish(
         )
     out.generated = coder.code(
         spec, out.plan, out.sitemap, answers, TESTS_DIR, bus,
-        source_insights=source_insights,
+        source_insights=source_insights, datasets=datasets,
     )
     out.generated, out.locator_reports = validator.validate(out.generated, out.sitemap, bus)
     out.initial_results = executor.execute(out.generated, TESTS_DIR, REPORTS_DIR, bus)
@@ -267,6 +271,7 @@ def run_phase_b(
     *,
     heal_failures: bool = True,
     source_insights: SourceInsights | None = None,
+    datasets: dict[str, list[str]] | None = None,
 ) -> PhaseB:
     """Run all of Phase B in one shot (explore → finish), without the URL pause.
 
@@ -278,4 +283,5 @@ def run_phase_b(
     return run_phase_b_finish(
         spec, answers, partial, bus,
         heal_failures=heal_failures, source_insights=source_insights,
+        datasets=datasets,
     )

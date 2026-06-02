@@ -39,6 +39,11 @@ test would TYPE or NAVIGATE TO, it DOES belong here.
         {"key":"invoice-due-date","value":"2026-12-31"}]`
     * PRD has no concrete values → return `[]`; the Inquirer will ask.
   Only extract values that are unambiguously stated. Do not guess defaults.
+- DATASET TOKENS: the text may contain `{{name}}` double-brace tokens (dataset \
+variables the user defined separately, e.g. `{{username}}`). Treat them as opaque \
+placeholders: keep them VERBATIM wherever you echo text, do NOT extract them into \
+`provided_values`, and do NOT flag them as ambiguous in `notes`. Their concrete \
+values are supplied later by parametrization.
 """
 
 INQUIRER_SYSTEM = """You are a senior QA engineer reviewing a TestSpec. Your job is to \
@@ -61,6 +66,9 @@ spec (including in `provided_values`), do NOT ask.
 needs the value.
 - NEVER ask for button labels, heading text, link text, or any UI copy — those come \
 from the Explorer's live DOM scrape, not from the user.
+- DATASET TOKENS: `{{name}}` double-brace tokens are user-supplied dataset variables. \
+NEVER ask for a value whose key matches a dataset variable name — the user already \
+provided those values.
 - If the spec is complete and nothing is needed, return an empty `items` list.
 
 - SOURCE-DERIVED HINTS (if a `# Source-derived hints` section is appended below \
@@ -118,6 +126,11 @@ present, and (3) the answers dict. The app's start URL (spec.app_url) is always 
 - Wherever a test needs a concrete value (credentials, names, amounts), reference the \
 answers dict by its kebab-case key in curly braces, e.g. `{login-email}`. Do NOT type \
 literal sample values. The coder will substitute these.
+- DATASET TOKENS: the spec may contain `{{name}}` DOUBLE-brace tokens. These are \
+user-defined dataset variables, distinct from the single-brace `{key}` answer \
+references above. Preserve `{{name}}` VERBATIM wherever it appears in the step text — \
+do NOT resolve it, rename it, or convert it to single braces. The Coder needs it intact \
+so the test can be run once per dataset value.
 - Keep tests independent — each one starts fresh. If a test needs to be logged in, \
 include the login steps at the top of the test.
 """
@@ -293,6 +306,16 @@ Hard rules:
     * Any `get_by_role("text", ...)` → there is no ARIA "text" role; must be \
       `page.get_by_text(...)`. \
     Do NOT explain in comments; just emit clean code.
+16. DATASET VARIABLES — the prompt may include a `# dataset_variables` section \
+    listing names like `username`. Wherever the value for one of those variables is \
+    needed, write the token EXACTLY as `{{name}}` (DOUBLE curly braces) inside an \
+    ordinary string literal, e.g. `page.get_by_role("textbox", name="Email", \
+    exact=True).fill("{{username}}")`. Rules: \
+    * Use double braces, never single — single braces are answer keys (rule 8). \
+    * Do NOT put a real value in; do NOT wrap it in an f-string or extra quotes. \
+    * Use the same `{{name}}` token everywhere that value is needed within the test. \
+    The pipeline replaces these tokens with `@pytest.mark.parametrize` after you \
+    finish, so the test runs once per dataset value automatically — you write it ONCE.
 """
 
 REPORTER_SYSTEM = """You write concise QA reports. Given the TestSpec, generated test \
@@ -369,6 +392,13 @@ Apply ALL of these rules (same as the Coder):
 
 15. SELF-REVIEW before output. Scan your rewritten code for any of the role/verb \
     mismatches in rule 14 and silently fix them.
+
+16. PRESERVE PARAMETRIZATION — if the code you receive has a \
+    `@pytest.mark.parametrize(...)` decorator and matching function parameters, keep \
+    BOTH verbatim: the same decorator line(s) above the function, and the same extra \
+    parameter names in the signature. Use those parameter names wherever the value is \
+    needed (e.g. `.fill(username)`). They drive data-driven runs — dropping them \
+    silently changes test coverage.
 
 Do NOT append a `pytest.fail(...)` line "as a hedge" — the validator handles that. \
 Just emit clean, working code that uses what the FRESH SiteMap provides.
