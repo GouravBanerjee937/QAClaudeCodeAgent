@@ -55,10 +55,15 @@ class ApiEndpoint:
     method: str  # GET, POST, PUT, DELETE, …
     path: str    # /api/items
     file: str = ""
+    response_fields: list[str] = field(default_factory=list)  # JSON keys returned
 
     def describe(self) -> str:
         loc = f"  (in {self.file})" if self.file else ""
-        return f"{self.method} {self.path}{loc}"
+        fields = (
+            f"   response_fields=[{', '.join(repr(f) for f in self.response_fields)}]"
+            if self.response_fields else ""
+        )
+        return f"{self.method} {self.path}{loc}{fields}"
 
 
 @dataclass
@@ -145,14 +150,25 @@ def _scan_repo(root: Path, out: SourceInsights) -> None:
         _extract_routes(text, seen_routes, out.routes)
 
     seen_eps: set[tuple[str, str]] = set()
+    # Capture API endpoints AND the dict-literal field names that appear in the
+    # same file, so the Coder/Healer can write `inv.get("number")` instead of
+    # inventing `inv.get("invoice_number")`.
+    fields_by_file: dict[str, list[str]] = {}
     for path in py_files:
         text = _safe_read(path)
         rel = str(path.relative_to(root))
         _extract_python_api(text, rel, seen_eps, out.api_endpoints)
+        fields_by_file[rel] = _extract_dict_field_names(text)
     for path in node_files:
         text = _safe_read(path)
         rel = str(path.relative_to(root))
         _extract_node_api(text, rel, seen_eps, out.api_endpoints)
+        fields_by_file.setdefault(rel, _extract_dict_field_names(text))
+    # Attach field names to each endpoint in the same source file.
+    for ep in out.api_endpoints:
+        cand = fields_by_file.get(ep.file, [])
+        if cand:
+            ep.response_fields = list(cand)
 
 
 # ──────────────────────────── helpers ────────────────────────────────────
@@ -255,6 +271,26 @@ def _extract_routes(text: str, seen: set[str], out: list[str]) -> None:
         if path and path not in seen and len(path) < 80:
             seen.add(path)
             out.append(path)
+
+
+# Capture string keys from dict / object literals — works across Python/JS/TS:
+#   {"number": 1, "itemName": "x"}  →  ['number', 'itemName']
+_DICT_KEY_RE = re.compile(r"""["'](\w+)["']\s*:""")
+
+
+def _extract_dict_field_names(text: str) -> list[str]:
+    """Best-effort: every string key seen in dict-literal patterns across the file,
+    ordered by frequency. Captures the JSON shape returned by API handlers without
+    needing to parse the code structurally."""
+    if not text:
+        return []
+    from collections import Counter
+    skip_methods = {"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"}
+    skip_pythonish = {"self", "args", "kwargs", "cls"}
+    skip = skip_methods | skip_pythonish
+    keys = [k for k in _DICT_KEY_RE.findall(text) if k not in skip]
+    counts = Counter(keys)
+    return [k for k, _ in counts.most_common(30)]
 
 
 # Detect plain stdlib BaseHTTPRequestHandler style: `if path == '/api/items':`

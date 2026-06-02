@@ -11,6 +11,7 @@ from ..models import (
     GeneratedTest, PageSnapshot, RunResults, SiteMap, TestCase, TestPlan, TestSpec,
 )
 from ..prompts import HEALER_SYSTEM
+from ..source import SourceInsights, render_hints_for_prompt
 from .coder import _post_process, _sanitize, _strip_fences
 from .explorer import _snapshot_page
 from playwright.sync_api import sync_playwright
@@ -25,6 +26,8 @@ def heal(
     answers: dict[str, str],
     tests_dir: Path,
     bus: EventBus,
+    *,
+    source_insights: SourceInsights | None = None,
 ) -> tuple[list[GeneratedTest], SiteMap]:
     """Returns (updated_generated_list, updated_sitemap). Mutates files on disk."""
     failed_ids = [r.test_case_id for r in results.results if r.status != "passed"]
@@ -68,9 +71,16 @@ def heal(
                 browser.close()
 
     # Merge fresh snapshots into a copy of the sitemap (for the healer prompt).
-    merged_pages = dict(sitemap.pages)
-    merged_pages.update(fresh_snaps)
-    fresh_sitemap = SiteMap(pages=merged_pages)
+    # Round-trip through plain dicts so Pydantic can't trip over hot-reloaded
+    # class-identity mismatches (Streamlit reloads modules on file edits, leaving
+    # two structurally-identical PageSnapshot classes in memory).
+    merged = {**sitemap.pages, **fresh_snaps}
+    fresh_sitemap = SiteMap.model_validate({
+        "pages": {
+            k: (v.model_dump() if hasattr(v, "model_dump") else v)
+            for k, v in merged.items()
+        }
+    })
 
     # Rewrite each failing test.
     updated = list(generated)
@@ -82,7 +92,10 @@ def heal(
         if not tc or not res:
             continue
         bus.emit("healer", f"Rewriting {gt.test_case_id}…")
-        new_code = _rewrite(spec, tc, gt, res.failure_message, fresh_sitemap, answers)
+        new_code = _rewrite(
+            spec, tc, gt, res.failure_message, fresh_sitemap, answers,
+            source_insights=source_insights,
+        )
         path = tests_dir / f"test_{_sanitize(tc.id)}.py"
         path.write_text(new_code, encoding="utf-8")
         updated[idx] = GeneratedTest(
@@ -100,6 +113,8 @@ def _rewrite(
     failure: str,
     sitemap: SiteMap,
     answers: dict[str, str],
+    *,
+    source_insights: SourceInsights | None = None,
 ) -> str:
     relevant_pages = [sitemap.pages[u] for u in tc.page_urls if u in sitemap.pages]
     if not relevant_pages:
@@ -122,5 +137,12 @@ def _rewrite(
         + "\n".join(sitemap_text)
         + f"\n\n# answers\n{json.dumps(answers, indent=2)}\n"
     )
+    # Append GitHub source hints (same cheat-sheet the Coder gets), so the Healer
+    # can cross-check HTML tags (e.g. #invoice-item <select> → use select_option,
+    # not fill) and known routes when rewriting.
+    if source_insights is not None and not source_insights.is_empty:
+        hints = render_hints_for_prompt(source_insights)
+        if hints:
+            prompt = prompt + "\n\n" + hints
     raw = text(HEALER_SYSTEM, prompt, temperature=0.1)
     return _post_process(_strip_fences(raw))

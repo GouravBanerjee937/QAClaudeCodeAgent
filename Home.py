@@ -122,6 +122,36 @@ def render_log() -> None:
 st.title("🧪 QA Autonomous Agent")
 st.caption("PRD → questions → tests → live diagnostics. Functional, role-based locators, Chromium.")
 
+# Persistent panel: show everything extracted from GitHub source.
+def _render_source_panel():
+    si = st.session_state.get("source_insights")
+    if not si or getattr(si, "is_empty", True):
+        return
+    header = (f"📂 Extracted from GitHub source ({si.repo_url}): "
+              f"{len(si.routes)} route(s) · {len(si.stable_ids)} HTML id(s) · "
+              f"{len(si.api_endpoints)} API endpoint(s)")
+    with st.expander(header, expanded=False):
+        if si.routes:
+            st.markdown("**Routes**")
+            for r in si.routes:
+                st.code(r, language=None)
+        if si.stable_ids:
+            st.markdown(f"**HTML element IDs ({len(si.stable_ids)})**")
+            st.caption("Format: `#id <tag> label='…' [from file]`")
+            for sid in si.stable_ids:
+                st.code(sid.describe(), language=None)
+        if si.api_endpoints:
+            st.markdown(f"**API endpoints ({len(si.api_endpoints)})**")
+            st.caption("Each shows the JSON field names the endpoint actually uses, "
+                       "read from the source code — these are what the Coder must use "
+                       "verbatim in backend assertions.")
+            for ep in si.api_endpoints:
+                st.code(ep.describe(), language=None)
+        if si.notes:
+            st.info(f"Notes: {si.notes}")
+
+_render_source_panel()
+
 with st.sidebar:
     st.header("Inputs")
     app_url = st.text_input(
@@ -235,7 +265,8 @@ if st.session_state.phase == "phase_a":
     with st.status("Analyst → reading PRD and identifying missing values…", expanded=True):
         try:
             phase_a = pipeline.run_phase_a(
-                st.session_state.prd_text, st.session_state.app_url, bus
+                st.session_state.prd_text, st.session_state.app_url, bus,
+                source_insights=st.session_state.get("source_insights"),
             )
         except Exception as exc:
             st.session_state.error = traceback.format_exc()
@@ -286,6 +317,29 @@ if st.session_state.phase == "questions":
     else:
         st.subheader("❓ Step 2 — Please provide these values")
         st.caption("The pipeline won't guess. Fill these in and it'll continue.")
+        # Show GitHub source data so the user can copy from it if needed.
+        si = st.session_state.get("source_insights")
+        if si and not getattr(si, "is_empty", True):
+            with st.expander(
+                f"📂 From your GitHub source: {len(si.routes)} route(s), "
+                f"{len(si.stable_ids)} HTML id(s), {len(si.api_endpoints)} API endpoint(s) — click to view",
+                expanded=True,
+            ):
+                st.caption("If a question asks for a URL or specific value, copy from here.")
+                if si.routes:
+                    st.markdown("**Routes:**")
+                    app_url = phase_a.spec.app_url
+                    from qa_agent.steps.coder import resolve_url
+                    for r in si.routes:
+                        st.code(f"{r}        →  {resolve_url(app_url, r)}", language=None)
+                if si.stable_ids:
+                    st.markdown("**HTML element IDs (with tag and label):**")
+                    for sid in si.stable_ids[:40]:
+                        st.code(sid.describe(), language=None)
+                if si.api_endpoints:
+                    st.markdown("**API endpoints:**")
+                    for ep in si.api_endpoints:
+                        st.code(ep.describe(), language=None)
         with st.form("answers_form"):
             answers: dict[str, str] = {}
             for q in questions:
@@ -352,9 +406,7 @@ if st.session_state.phase == "phase_b":
             st.rerun()
         else:
             st.session_state.phase_b_partial = partial
-            problems = pipeline.unreachable_urls(
-                st.session_state.phase_a.spec, partial.plan, partial.sitemap,
-            )
+            problems = _collect_url_problems(partial)
             if problems:
                 st.session_state.url_problems = problems
                 status.update(
@@ -368,37 +420,81 @@ if st.session_state.phase == "phase_b":
             st.rerun()
 
 
-# Stage B1.5 — pause: the Explorer couldn't reach some URLs. Ask the user.
+def _collect_url_problems(partial) -> list[dict]:
+    """Combine two checks: URLs the Designer guessed (not in PRD / source / answers)
+    + URLs the Explorer couldn't load. Each entry has a 'reason' so the UI can tell."""
+    spec = st.session_state.phase_a.spec
+    guessed = pipeline.guessed_urls(
+        spec, partial.plan, st.session_state.answers,
+        prd_text=st.session_state.get("prd_text", ""),
+        source_insights=st.session_state.get("source_insights"),
+    )
+    unreachable = pipeline.unreachable_urls(spec, partial.plan, partial.sitemap)
+    # Deduplicate by (test_case_id, url) — prefer 'guess' reason if both apply
+    seen, merged = set(), []
+    for p in guessed:
+        k = (p["test_case_id"], p["url"])
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(p)
+    for p in unreachable:
+        k = (p["test_case_id"], p["url"])
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append({**p, "reason": "unreachable"})
+    return merged
+
+
+# Stage B1.5 — pause: URLs the Designer guessed OR the Explorer couldn't load. Ask the user.
 if st.session_state.phase == "verify_urls":
     problems = st.session_state.get("url_problems", [])
+    n_guess = sum(1 for p in problems if p.get("reason") == "guess")
+    n_unreach = sum(1 for p in problems if p.get("reason") == "unreachable")
     st.subheader("🛑 Confirm these URLs — I won't guess")
-    st.caption(
-        "The Explorer couldn't load a usable page for the URL(s) below (the page "
-        "was missing, or returned no interactable elements). Enter the correct URL "
-        "for each. My best guess is pre-filled as a suggestion — change it if it's wrong."
-    )
+    msg = []
+    if n_guess:
+        msg.append(f"{n_guess} URL(s) the test planner picked but you never gave me "
+                   f"(not in your PRD, not in the GitHub source, not in your answers).")
+    if n_unreach:
+        msg.append(f"{n_unreach} URL(s) that didn't return a usable page.")
+    st.caption(" ".join(msg) + " Enter the correct URL for each. My best guess is "
+               "pre-filled as a suggestion — change it if it's wrong.")
+    # Show all GitHub source routes once at the top so the user can copy from them.
+    si = st.session_state.get("source_insights")
+    if si and getattr(si, "routes", None):
+        with st.expander(f"📂 {len(si.routes)} route(s) found in your GitHub source — click to view", expanded=True):
+            st.write("These are the routes the GitHub source reader extracted. "
+                     "Copy whichever one is the right page for the test below.")
+            app_url = st.session_state.phase_a.spec.app_url
+            for r in si.routes:
+                # Build the full URL form too, so a copy is one click away
+                from qa_agent.steps.coder import resolve_url
+                full = resolve_url(app_url, r)
+                st.code(f"{r}        →  {full}", language=None)
     with st.form("verify_urls_form"):
         corrections: dict[str, str] = {}
         for i, p in enumerate(problems):
-            st.markdown(f"**Test `{p['test_case_id']}`** needs a page it couldn't reach.")
-            st.caption(f"Planned URL that failed: `{p['url']}`")
+            reason_tag = "🤖 GUESSED" if p.get("reason") == "guess" else "🚫 UNREACHABLE"
+            st.markdown(f"**Test `{p['test_case_id']}`** — {reason_tag}")
+            st.caption(f"Planned URL: `{p['url']}`")
             corrections[f"{p['test_case_id']}::{p['url']}"] = st.text_input(
                 "Correct URL",
                 value=p["suggestion"],
                 key=f"url_fix_{i}",
-                help="Suggestion pre-filled from my best guess — edit if it's wrong.",
+                help="Suggestion pre-filled from my best guess — edit if it's wrong. "
+                     "If your GitHub source has the right route, copy it from the panel above.",
             )
             st.divider()
         submitted = st.form_submit_button("▶ Use these URLs & continue", type="primary")
 
     if submitted:
         partial = st.session_state.phase_b_partial
-        # Patch the failed URLs in the plan with the user's corrections.
         for tc in partial.plan.test_cases:
             tc.page_urls = [
                 corrections.get(f"{tc.id}::{u}", u) for u in tc.page_urls
             ]
-        # Re-explore (Explorer only — no re-design) with the corrected URLs.
         st.session_state.events = []
         bus = bus_for_session()
         with st.status("🔎 Re-exploring with your URLs…", expanded=True) as status:
@@ -415,14 +511,10 @@ if st.session_state.phase == "verify_urls":
             else:
                 status.update(label="✅ Re-exploration complete", state="complete")
         st.session_state.phase_b_partial = partial
-        remaining = pipeline.unreachable_urls(
-            st.session_state.phase_a.spec, partial.plan, partial.sitemap,
-        )
+        remaining = _collect_url_problems(partial)
         if remaining:
             st.session_state.url_problems = remaining
-            st.warning(
-                "Some URLs still couldn't be reached — please correct them and try again."
-            )
+            st.warning("Some URLs still need confirmation — please correct them and try again.")
             st.rerun()
         else:
             st.session_state.phase = "phase_b_finish"
@@ -956,6 +1048,7 @@ if st.session_state.phase == "human_execute":
             if initial.failed > 0:
                 healed, fresh_sitemap = _h_healer.heal(
                     spec, plan, sitemap, generated, initial, answers, pipeline.TESTS_DIR, bus,
+                    source_insights=st.session_state.get("source_insights"),
                 )
                 sitemap = fresh_sitemap
                 healed, locator_reports = _h_validator.validate(healed, sitemap, bus)

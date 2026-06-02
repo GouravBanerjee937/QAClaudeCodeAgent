@@ -42,19 +42,40 @@ def code(
     return generated
 
 
-# gpt-5 keeps writing `get_by_role("text", name="X", ...)` for status messages
-# even though "text" isn't a real ARIA role and Playwright will return nothing.
-# The right call is `get_by_text("X", exact=True)`. We auto-fix this here so the
-# generated code actually runs.
+# Deterministic role/verb fixes. The Coder prompt has the same rules, but small
+# models still slip — these regexes enforce the role-to-verb mapping after the
+# fact so a single mistake doesn't cause a runtime failure.
+#
+# Rule: "text" role doesn't exist; use get_by_text instead.
 _BAD_TEXT_ROLE_RE = re.compile(
     r"""get_by_role\(\s*["']text["']\s*,\s*name\s*=\s*(["'][^"']+["'])\s*(?:,\s*exact\s*=\s*True\s*)?\)""",
     re.VERBOSE,
 )
+# Rule: combobox/<select> uses .select_option, not .fill.
+_COMBOBOX_FILL_RE = re.compile(
+    r"""(get_by_role\(\s*["']combobox["'][^)]*\))\.fill\(""",
+)
+# Rule: checkbox/radio uses .check (no args), not .fill(...).
+_CHK_RAD_FILL_RE = re.compile(
+    r"""(get_by_role\(\s*["'](?:checkbox|radio)["'][^)]*\))\.fill\([^)]*\)""",
+)
+# Rule: button/link uses .click() (no args), not .fill(...).
+_BTN_LNK_FILL_RE = re.compile(
+    r"""(get_by_role\(\s*["'](?:button|link)["'][^)]*\))\.fill\([^)]*\)""",
+)
 
 
 def _post_process(source: str) -> str:
-    """Apply deterministic fixes to LLM-generated code before validation."""
-    return _BAD_TEXT_ROLE_RE.sub(lambda m: f"get_by_text({m.group(1)}, exact=True)", source)
+    """Apply deterministic fixes to LLM-generated code before validation.
+
+    Enforces the Playwright role→verb mapping that the Coder/Healer prompts also
+    spell out. Belt-and-suspenders: if the model slips, the regex catches it.
+    """
+    s = _BAD_TEXT_ROLE_RE.sub(lambda m: f"get_by_text({m.group(1)}, exact=True)", source)
+    s = _COMBOBOX_FILL_RE.sub(r"\1.select_option(", s)
+    s = _CHK_RAD_FILL_RE.sub(r"\1.check()", s)
+    s = _BTN_LNK_FILL_RE.sub(r"\1.click()", s)
+    return s
 
 
 def resolve_url(app_url: str, path: str) -> str:

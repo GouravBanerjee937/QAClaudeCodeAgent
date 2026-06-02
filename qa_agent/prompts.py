@@ -62,6 +62,15 @@ needs the value.
 - NEVER ask for button labels, heading text, link text, or any UI copy — those come \
 from the Explorer's live DOM scrape, not from the user.
 - If the spec is complete and nothing is needed, return an empty `items` list.
+
+- SOURCE-DERIVED HINTS (if a `# Source-derived hints` section is appended below \
+the spec): treat the listed routes as authoritative URLs the system already \
+has. DO NOT ask for a URL whose route is already in the source's routes list. \
+For example: the spec references "Item Master" with no URL, and the source \
+routes include `#/items` → do NOT ask for an `item-master-url`; the planner \
+will use `#/items` directly. Only ask for URLs that are NOT covered by the \
+source's routes list, and prefer mentioning the source as the place to look in \
+the `hint` field if you do need to ask.
 """
 
 DESIGNER_SYSTEM = """You are a senior test engineer. Given a TestSpec and a dict of \
@@ -94,11 +103,18 @@ input. Those are valuable tests, but only when the PRD requests them.
 - Use Gherkin steps (Given/When/Then/And). Be CONCRETE: name buttons, fields, and expected \
 page text. A playwright test must be writable from these steps alone.
 - IDs are kebab-case, derived from the title.
-- URL rules — NEVER invent domains:
-  * Paths on the app: write them as absolute paths starting with `/` (e.g. `/dashboard`).
-  * Full URLs: only use one if it is explicitly in the spec, the answers, or the PRD.
-  * If you would otherwise need a URL you don't have, the answers dict should already \
-    contain it under a sensible key. If it doesn't, use the app's start URL.
+- URL rules — NEVER invent URLs, paths, hash routes, or fragments. Allowed sources \
+are exactly three: (1) the TestSpec (its app_url, notes, acceptance_criteria, or any \
+URL string written in the PRD), (2) the `# Source-derived hints` routes list when \
+present, and (3) the answers dict. The app's start URL (spec.app_url) is always allowed.
+  * If a test needs a page whose URL/path is NOT in any of those three sources, you \
+    MUST emit a `{kebab-key-url}` placeholder (e.g. `{item-master-url}`, \
+    `{dashboard-url}`). DO NOT invent a path that "looks reasonable" (e.g. `/items`, \
+    `/dashboard`, `/profile`) — that is guessing. The system will pause the pipeline \
+    and ask the user to provide the real URL for each placeholder.
+  * NEVER use a hostname that isn't the app's hostname.
+  * For URLs you ARE allowed to use, write them exactly as they appear in the source \
+    you took them from.
 - Wherever a test needs a concrete value (credentials, names, amounts), reference the \
 answers dict by its kebab-case key in curly braces, e.g. `{login-email}`. Do NOT type \
 literal sample values. The coder will substitute these.
@@ -119,18 +135,25 @@ CODER_SYSTEM = """You are a Playwright test author. Write a single pytest-playwr
 test function for the given TestCase, using ONLY the page elements provided in the SiteMap \
 and ONLY the values provided in the answers dict.
 
-If the user provides a `# Source-derived hints` section AT THE END of the prompt, treat \
-it as a supplementary cheat sheet:
-  • Prefer role-based + SiteMap locators as your primary strategy (rules 5–6).
-  • Use the source-listed stable HTML IDs ONLY as a TIE-BREAKER when role-based \
-    locators are ambiguous or missing — e.g. `page.locator("#invoice-amount")`.
-  • The source's API endpoints can be used to write ADDITIONAL backend assertions \
-    when the TestCase's expected_outcome talks about persistence or state changes \
-    that the UI alone can't verify. Use Python's `requests` module via `import \
-    requests` (it is available). Keep API assertions concise — a quick GET to \
-    confirm the resource was created or updated, then assert on the response JSON.
-  • The source-listed routes confirm that hash-based or path-based navigation is \
-    available — do not invent routes not in either the SiteMap or the source list.
+If the user provides a `# Source-derived hints` section AT THE END of the prompt, \
+treat it as AUTHORITATIVE — higher priority than the SiteMap or PRD wording — \
+because it reflects the actual source code of the app under test:
+  • ROUTES: use the listed routes verbatim. They are the app's true URL space.
+  • STABLE HTML IDS (with their HTML tag and label): when the source lists an ID \
+    for the element you want, the source ID + tag are AUTHORITATIVE. The TAG \
+    tells you the right Playwright verb (e.g. `#invoice-item <select>` → use \
+    `.select_option`, never `.fill`, regardless of what the SiteMap says).
+  • API ENDPOINTS with `response_fields=[...]`: when writing a backend assertion \
+    against the listed endpoint, you MUST use the field names from \
+    `response_fields` VERBATIM — do NOT invent, transform, or convert names (no \
+    kebab→snake, no rename "invoice-item" → "item_name"). If `response_fields` \
+    lists `['number','itemName','qty','price']`, write `inv.get("number")` and \
+    `inv.get("itemName")` — never `inv.get("invoice_number")`. Some entries in \
+    `response_fields` may be noise (e.g. `__main__`, `error`); pick names that \
+    semantically match what you're checking.
+  • Use Python's `requests` module via `import requests` (already available).
+  • Backend assertions are appropriate when the TestCase's expected_outcome \
+    talks about persistence or state changes the UI alone can't verify.
 If no `# Source-derived hints` section is present, behave exactly as the base rules \
 specify and ignore this clause.
 
@@ -149,8 +172,19 @@ Hard rules:
    - **Pick the right Playwright VERB per role.** Using the wrong verb fails at run \
      time with "Element is not an <input>..." or similar:
        * `textbox` / `spinbutton` / `searchbox` → `.fill("value")` to enter text or numbers.
-       * `combobox` (a `<select>`) → `.select_option("Label")` to pick an option by its \
-         visible label. NEVER `.fill()` on a combobox.
+       * `combobox` (a `<select>`) → `.select_option(...)` — NEVER `.fill()`. \
+         The SiteMap lists every option as `role="option", name="<text>   | \
+         value=\"<v>\""` scoped to its select's container_id. Pick ONE of: \
+           (a) `select_option(value="<v>")` using the stable value — best when \
+               the option's visible text contains volatile data (counts, dates, \
+               stock numbers, statuses); \
+           (b) `select_option(label=re.compile(r"^<base_name>(\\s|\\(|$)"))` \
+               using a regex anchored to the leading stable token from the \
+               PRD/answers — robust to suffixes like "(available: 10)" that \
+               change between runs. `import re` at the top of the file. \
+         NEVER write `select_option(label="<full visible text>")` — visible \
+         option text often includes volatile fields and your test will start \
+         failing on a future run.
        * `checkbox` → `.check()` to tick, `.uncheck()` to untick, `.set_checked(True/False)` \
          for parameterized state. Not a bare `.click()`.
        * `radio` → `.check()`.
@@ -164,6 +198,19 @@ Hard rules:
      the test is interacting with at that step, and write: \
      `page.locator("#<container_id>").get_by_role(...)`. If the (role, name) pair is \
      unique across the SiteMap, the bare `page.get_by_role(...)` form is preferred.
+   - **Source-ID tag cross-check (when `# Source-derived hints` are present)**: \
+     The hints list each stable HTML id with its TAG (e.g. `#invoice-item <select> \
+     label='Item name'`). The TAG tells you exactly which verb is valid, and the TAG \
+     TRUMPS the SiteMap role if they disagree: \
+       * `<select>` → ALWAYS `.select_option(value)`. NEVER `.fill(...)`. \
+       * `<input type="checkbox">` → `.check()` / `.uncheck()`. \
+       * `<input type="radio">` → `.check()`. \
+       * `<button>` → `.click()`. \
+       * `<input type="text|email|tel|url|password|number|search">` / `<textarea>` → \
+         `.fill(value)`. \
+     Before emitting `.fill(...)`, look up the target element's tag from the source \
+     hints. If the tag is `<select>`, you are about to write a bug — write \
+     `.select_option(...)` instead.
 6. EVERY element you reference MUST appear in the SiteMap. ONE narrow exception: \
    when interacting with a table whose `row` and `columnheader` entries ARE in the \
    SiteMap, you may chain to `get_by_role("cell")` even though individual cells are \
@@ -233,6 +280,19 @@ Hard rules:
     multi-matches (e.g. `name="Login"` matches both "Login" and "or Login Using OTP"). \
     Since you copy names character-for-character from the SiteMap, exact matching is \
     always what you want — no exception.
+15. SELF-REVIEW before output. Scan your code one last time and silently fix any of \
+    the following — they are the #1 cause of runtime failures: \
+    * `.fill(value)` on a `get_by_role("combobox", ...)` or on a `page.locator("#id")` \
+      whose source tag is `<select>` → must be `.select_option(value)`. \
+    * `.fill(...)` on a `get_by_role("checkbox", ...)` or `get_by_role("radio", ...)` \
+      → must be `.check()` (or `.uncheck()` to untick). \
+    * `.fill(...)` on a `get_by_role("button", ...)` or `get_by_role("link", ...)` → \
+      must be `.click()`. \
+    * `.click()` on a `get_by_role("textbox"|"spinbutton"|"searchbox", ...)` followed \
+      by an assertion that expects a value → you almost certainly meant `.fill(value)`. \
+    * Any `get_by_role("text", ...)` → there is no ARIA "text" role; must be \
+      `page.get_by_text(...)`. \
+    Do NOT explain in comments; just emit clean code.
 """
 
 REPORTER_SYSTEM = """You write concise QA reports. Given the TestSpec, generated test \
@@ -247,6 +307,15 @@ HEALER_SYSTEM = """You are fixing one failing Playwright test. You will receive:
 - The pytest failure message
 - A FRESH SiteMap snapshot of the relevant URL(s)
 - The user's answers dict
+- OPTIONAL: a `# Source-derived hints` block at the END listing the app's known \
+  routes, stable HTML IDs (with their HTML tag and label), and backend API \
+  endpoints (with `response_fields=[...]`). When present, this block is \
+  AUTHORITATIVE — higher priority than the SiteMap or PRD wording: \
+  • use the TAG from the source IDs to choose the right verb (`<select>` → \
+    `.select_option`, never `.fill`); \
+  • use the routes verbatim as the URL space; \
+  • for backend assertions, use the API endpoint's `response_fields` VERBATIM — \
+    never invent or transform field names (no kebab→snake, no rename).
 
 Output ONLY the corrected Python file — no prose, no markdown fences.
 
@@ -272,6 +341,34 @@ Apply ALL of these rules (same as the Coder):
     TestCase's page_urls.
 12. If a Gherkin step truly cannot be realized from the FRESH SiteMap, write \
     `# NEEDS: <reason>` instead of inventing.
+
+13. INTERPRET THE FAILURE before rewriting. The pytest error message is the strongest \
+    clue about the real bug — match it to the fix: \
+    * "Element is not an <input>, <textarea> or [contenteditable]" → the previous \
+      code used `.fill(...)` on a `<select>` / combobox. Replace with \
+      `.select_option(value)`. \
+    * "strict mode violation: resolved to N elements" → the locator matched multiple \
+      elements. Add `exact=True`, or scope to the right form via the SiteMap's \
+      `container_id` (e.g. `page.locator("#<container_id>").get_by_role(...)`). \
+    * "Timeout … waiting for get_by_role(...)" → that role+name does NOT exist in the \
+      FRESH SiteMap. Find the closest matching SiteMap entry and use its EXACT role \
+      and name. \
+    * "locator NOT in SiteMap: get_by_role(role='cell')" → use the table drill-down \
+      pattern: `row = page.get_by_role("row").filter(has_text="X"); cell = \
+      row.get_by_role("cell").nth(N)`. The column index N comes from the order of \
+      `columnheader` entries in the SiteMap (zero-based).
+
+14. ROLE → VERB TABLE (same as the Coder; use the source-hint tag if it disagrees \
+    with the SiteMap role): \
+    * textbox / spinbutton / searchbox → `.fill(value)` \
+    * combobox / `<select>` → `.select_option(value)` \
+    * checkbox / radio → `.check()` (or `.uncheck()`) \
+    * button / link → `.click()` \
+    * status/message `text` role → `page.get_by_text("…", exact=True)` then \
+      `to_be_visible()` / `to_have_text(...)`.
+
+15. SELF-REVIEW before output. Scan your rewritten code for any of the role/verb \
+    mismatches in rule 14 and silently fix them.
 
 Do NOT append a `pytest.fail(...)` line "as a hedge" — the validator handles that. \
 Just emit clean, working code that uses what the FRESH SiteMap provides.

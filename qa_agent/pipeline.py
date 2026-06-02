@@ -42,9 +42,15 @@ class PhaseB:
     report_markdown: str = ""
 
 
-def run_phase_a(prd_text: str, app_url: str, bus: EventBus) -> PhaseA:
-    spec = analyst.analyze(prd_text, app_url, bus)
-    questions = inquirer.inquire(spec, bus)
+def run_phase_a(
+    prd_text: str,
+    app_url: str,
+    bus: EventBus,
+    *,
+    source_insights: SourceInsights | None = None,
+) -> PhaseA:
+    spec = analyst.analyze(prd_text, app_url, bus, source_insights=source_insights)
+    questions = inquirer.inquire(spec, bus, source_insights=source_insights)
     return PhaseA(spec=spec, questions=questions)
 
 
@@ -113,6 +119,90 @@ def unreachable_urls(
     return problems
 
 
+def guessed_urls(
+    spec: TestSpec,
+    plan: TestPlan,
+    answers: dict[str, str],
+    *,
+    prd_text: str = "",
+    source_insights: SourceInsights | None = None,
+) -> list[dict[str, str]]:
+    """Planned URLs that did NOT come from any source the user authorised.
+
+    A URL is "sourced" only if it appears in one of:
+      1. The PRD text the user wrote (and anything the Analyst derived from it
+         that lives on the spec: app_url, notes, acceptance criteria).
+      2. The GitHub source's routes list (when source enrichment is on).
+      3. The answers dict (i.e. a value the user supplied directly).
+
+    Everything else is treated as a guess by the Designer, regardless of whether
+    the Explorer was able to "load" it (single-page apps return the same HTML on
+    every route, so reachability is not a reliable signal). Each entry carries a
+    `suggestion` (the resolved absolute URL) so the UI can pre-fill it.
+    """
+    from urllib.parse import urlparse
+
+    from .steps.coder import resolve_url
+
+    # Build a single haystack of everything the user authorised.
+    chunks: list[str] = []
+    if spec.app_url:
+        chunks.append(spec.app_url)
+    if prd_text:
+        chunks.append(prd_text)
+    if spec.notes:
+        chunks.append(spec.notes)
+    chunks.extend(spec.acceptance_criteria)
+    if source_insights and source_insights.routes:
+        chunks.extend(source_insights.routes)
+    for v in answers.values():
+        if v:
+            chunks.append(str(v))
+    haystack = " ".join(c.lower() for c in chunks)
+
+    def _sourced(url: str) -> bool:
+        if not url:
+            return True
+        if "{" in url:
+            return True  # placeholder — handled elsewhere
+        u = url.lower().strip()
+        if u in haystack:
+            return True
+        if spec.app_url and u == spec.app_url.lower():
+            return True
+        try:
+            p = urlparse(url)
+        except Exception:
+            return False
+        # hash-route SPA: check the fragment in several common shapes
+        if p.fragment:
+            frag = p.fragment.lower()
+            if any(form in haystack for form in (frag, "#" + frag, "#/" + frag.lstrip("/"))):
+                return True
+        # path-style URL: check the path itself if non-trivial
+        if p.path and len(p.path) > 1 and p.path.lower() in haystack:
+            return True
+        return False
+
+    problems: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for tc in plan.test_cases:
+        for url in tc.page_urls:
+            if _sourced(url):
+                continue
+            key = (tc.id, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            problems.append({
+                "test_case_id": tc.id,
+                "url": url,
+                "suggestion": resolve_url(spec.app_url, url),
+                "reason": "guess",
+            })
+    return problems
+
+
 def run_phase_b_finish(
     spec: TestSpec,
     answers: dict[str, str],
@@ -150,7 +240,7 @@ def run_phase_b_finish(
     if heal_failures and out.initial_results.failed > 0:
         out.healed_generated, fresh_sitemap = healer.heal(
             spec, out.plan, out.sitemap, out.generated, out.initial_results,
-            answers, TESTS_DIR, bus,
+            answers, TESTS_DIR, bus, source_insights=source_insights,
         )
         out.sitemap = fresh_sitemap
         # Re-validate against the FRESH sitemap. The healer's output must pass the

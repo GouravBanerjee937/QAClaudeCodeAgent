@@ -6,14 +6,25 @@ from ..events import EventBus
 from ..llm import structured
 from ..models import TestSpec
 from ..prompts import ANALYST_SYSTEM
+from ..source import SourceInsights, render_hints_for_prompt
 
 
-def analyze(prd_text: str, app_url: str, bus: EventBus) -> TestSpec:
+def analyze(
+    prd_text: str,
+    app_url: str,
+    bus: EventBus,
+    *,
+    source_insights: SourceInsights | None = None,
+) -> TestSpec:
     bus.emit("analyst", "Reading PRD and extracting functional requirements…")
     user = (
         f"App URL provided by user (use this if PRD omits one): {app_url}\n\n"
         f"PRD:\n{prd_text}"
     )
+    if source_insights is not None:
+        hints = render_hints_for_prompt(source_insights)
+        if hints:
+            user = user + "\n\n" + hints
     spec = structured(ANALYST_SYSTEM, user, TestSpec)
     if not spec.app_url:
         spec.app_url = app_url

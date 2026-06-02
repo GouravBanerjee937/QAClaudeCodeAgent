@@ -464,6 +464,25 @@ def _scrape_elements(page: Page) -> list[dict[str, str]]:
           });
         });
       });
+
+      // <select> options — record the visible text AND the stable value of every
+      // <option>. The text can contain volatile data (e.g. "Pencil (available: 10)")
+      // so the Coder is told to either use the value directly OR a regex-match on
+      // the leading stable name, NEVER an exact text match.
+      document.querySelectorAll('select').forEach((sel) => {
+        const selId = sel.id || (sel.closest('[id]') ? sel.closest('[id]').id : '');
+        Array.from(sel.options).forEach((opt) => {
+          const text = (opt.text || opt.label || '').trim();
+          const value = (opt.value || '').trim();
+          if (!text && !value) return;
+          // Encode "<text>" or "<text> | value=<value>" so both are visible to the Coder.
+          const display = value ? (text + '   | value="' + value + '"') : text;
+          const key = 'option::' + display + '::' + selId;
+          if (seen.has(key)) return;
+          seen.add(key);
+          out.push({role: 'option', name: display, container_id: selId});
+        });
+      });
       return out;
     }
     """
@@ -480,13 +499,14 @@ def _label_elements(raw: list[dict[str, str]]) -> list[PageElement]:
     # don't need an LLM-written "purpose" — passing them through the labeller is
     # wasteful and risky (the labeller has been seen to silently drop them).
     # We emit those directly with a deterministic purpose string.
-    PASSTHROUGH_ROLES = {"row", "columnheader", "rowheader", "cell", "listitem"}
+    PASSTHROUGH_ROLES = {"row", "columnheader", "rowheader", "cell", "listitem", "option"}
     PASSTHROUGH_PURPOSES = {
         "row": "table row",
         "columnheader": "table column header",
         "rowheader": "table row header",
         "cell": "table cell",
         "listitem": "list item",
+        "option": "dropdown option (visible label)",
     }
 
     # Split: structural elements bypass the labeller; everything else goes through.
