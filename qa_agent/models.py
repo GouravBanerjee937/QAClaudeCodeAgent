@@ -92,6 +92,15 @@ class PageElement(BaseModel):
             "the same DOM (e.g. SPAs that keep all routes' markup mounted)."
         ),
     )
+    visible: bool = Field(
+        default=True,
+        description=(
+            "Whether the element was actually visible on the page when scraped. "
+            "SPAs keep hidden forms mounted in the DOM; a hidden element exists "
+            "but cannot be interacted with until something reveals it (e.g. a "
+            "'Create X' button or navigating to that form's URL)."
+        ),
+    )
 
 
 class PageSnapshot(BaseModel):

@@ -37,6 +37,10 @@ def code(
             prompt = prompt + "\n\n" + source_hints
         raw = text(CODER_SYSTEM, prompt, temperature=0.1)
         source = _post_process(_strip_fences(raw))
+        source = _resolve_select_options(
+            source, sitemap, answers,
+            on_fix=lambda msg: bus.emit("coder", msg, level="warn"),
+        )
         source = apply_datasets(
             source, datasets,
             on_warn=lambda msg: bus.emit("coder", msg, level="warn"),
@@ -76,6 +80,17 @@ _BTN_LNK_FILL_RE = re.compile(
 _ROW_NAME_RE = re.compile(
     r"""get_by_role\(\s*["']row["']\s*,\s*name\s*=\s*(["'])([^"']+)\1[^)]*\)""",
 )
+# Rule: comparing a numeric JSON field as a STRING breaks on float vs int
+# serialization (e.g. API returns price 10.0, test checks str(price) == "10" →
+# "10.0" != "10"). Rewrite `str(<expr>) == "<number>"` to a numeric comparison
+# `float(<expr>) == <number>`, which is True for 10.0, 10, and "10" alike.
+# Handles ==, !=, and the reversed operand order.
+_STR_NUM_CMP_RE = re.compile(
+    r"""str\(\s*(?P<expr>.+?)\s*\)\s*(?P<op>==|!=)\s*["'](?P<num>\d+(?:\.\d+)?)["']"""
+)
+_NUM_STR_CMP_RE = re.compile(
+    r"""["'](?P<num>\d+(?:\.\d+)?)["']\s*(?P<op>==|!=)\s*str\(\s*(?P<expr>.+?)\s*\)"""
+)
 
 
 def _post_process(source: str) -> str:
@@ -91,7 +106,86 @@ def _post_process(source: str) -> str:
     s = _ROW_NAME_RE.sub(
         lambda m: f'get_by_role("row").filter(has_text="{m.group(2)}")', s
     )
+    s = _STR_NUM_CMP_RE.sub(
+        lambda m: f'float({m.group("expr")}) {m.group("op")} {m.group("num")}', s
+    )
+    s = _NUM_STR_CMP_RE.sub(
+        lambda m: f'{m.group("num")} {m.group("op")} float({m.group("expr")})', s
+    )
     return s
+
+
+_OPTION_NAME_RE = re.compile(r'^(?P<text>.*?)\s*\|\s*value="(?P<value>[^"]*)"\s*$')
+_SELECT_OPTION_CALL_RE = re.compile(
+    r"""\.select_option\(\s*(?:value|label)\s*=\s*["'][^"']*["']\s*\)"""
+)
+
+
+def _parse_option(name: str) -> tuple[str, str]:
+    """'Mobile   | value="3"' -> ('Mobile', '3'); plain text -> (text, '')."""
+    m = _OPTION_NAME_RE.match(name)
+    if m:
+        return m.group("text").strip(), m.group("value")
+    return name.strip(), ""
+
+
+def _resolve_select_options(source, sitemap, answers, *, on_fix=None) -> str:
+    """Deterministically force `select_option(...)` to the option that matches the
+    item the user actually named in the PRD/answers.
+
+    Small models sometimes guess a dropdown value (e.g. value="1"=bottle when the
+    PRD said "Mobile"=value 3). The real options live in the SiteMap as
+    role='option' entries (name like 'Mobile   | value="3"'). When the page has a
+    single <select> and exactly one answer value names one of its options, we
+    rewrite every select_option call to that option's value. Conservative: if it's
+    ambiguous (0 or >1 matching option, or multiple selects), we leave the code
+    untouched rather than risk a wrong "fix".
+    """
+    # Collect options grouped by their <select> id (the option's container_id).
+    opts_by_select: dict[str, list[tuple[str, str]]] = {}
+    for snap in sitemap.pages.values():
+        for el in snap.elements:
+            if el.role != "option":
+                continue
+            text, value = _parse_option(el.name)
+            if not value:
+                continue
+            bucket = opts_by_select.setdefault(el.container_id, [])
+            if (text, value) not in bucket:
+                bucket.append((text, value))
+
+    if len(opts_by_select) != 1:
+        return source  # zero or multiple selects → don't guess which to touch
+    options = next(iter(opts_by_select.values()))
+
+    answer_vals = [str(v).strip() for v in answers.values() if str(v).strip()]
+
+    def _matches(opt_text: str, av: str) -> bool:
+        o, a = opt_text.lower(), av.lower()
+        return o == a or o.startswith(a + " ") or o.startswith(a + "(")
+
+    intended = []
+    for text, value in options:
+        if any(_matches(text, av) for av in answer_vals):
+            intended.append((text, value))
+    # de-dup by value
+    uniq = list(dict.fromkeys(v for _, v in intended))
+    if len(uniq) != 1:
+        return source  # can't determine a single intended item → leave as-is
+
+    correct_value = uniq[0]
+    correct_text = next(t for t, v in intended if v == correct_value)
+
+    def _sub(m):
+        return f'.select_option(value="{correct_value}")'
+
+    new_source, n = _SELECT_OPTION_CALL_RE.subn(_sub, source)
+    if n and new_source != source and on_fix:
+        on_fix(
+            f"  → forced dropdown selection to '{correct_text}' (value=\"{correct_value}\") "
+            f"from the SiteMap options (overrode a guessed value)."
+        )
+    return new_source
 
 
 def resolve_url(app_url: str, path: str) -> str:
@@ -143,12 +237,23 @@ def _build_prompt(
             "",
         ])
     parts.append("# SiteMap — allowed elements (use these EXACT role+name strings)")
+    parts.append(
+        "Each element is tagged VISIBLE or HIDDEN as scraped on that page. A HIDDEN "
+        "element exists in the DOM but is not rendered — you CANNOT interact with it "
+        "until it is revealed. To use a HIDDEN form field you MUST first either "
+        "navigate directly to that field's own page URL (prefer page.goto with the "
+        "resolved/source route, e.g. .../#/invoices/new), or click the control that "
+        "opens it (e.g. a 'Create Invoice' button). Do NOT fill/click a HIDDEN element "
+        "directly — it will time out."
+    )
     for snap in snapshots:
         parts.append(f"\n## Page: {snap.url}  (title: {snap.title!r})")
         if not snap.elements:
             parts.append("(no labeled elements captured — likely auth-gated; use # NEEDS: markers)")
         for el in snap.elements:
-            parts.append(f'- role="{el.role}", name="{el.name}"  — {el.purpose}')
+            vis = "VISIBLE" if getattr(el, "visible", True) else "HIDDEN"
+            cid = f' container_id="{el.container_id}"' if el.container_id else ""
+            parts.append(f'- [{vis}] role="{el.role}", name="{el.name}"{cid}  — {el.purpose}')
     return "\n".join(parts)
 
 

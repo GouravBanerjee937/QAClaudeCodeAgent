@@ -104,10 +104,20 @@ limited to):
   * "verify the page title or meta tags"
   * "verify accessibility / keyboard navigation"
   * "verify field type/format (e.g., type='password')"
+  * "sees a welcome message / greeting" or "the username/email is displayed on \
+    screen" — DO NOT invent these. Unless the PRD literally names a specific \
+    confirmation string, do not assert that any greeting, welcome text, or the \
+    user's own name appears anywhere.
   Stick to what the PRD says, no more. If the PRD says "fill X then click Save and see \
 confirmation", the test should do exactly that — not also assert that the field is \
 required, that the submit button was disabled before, or that errors appear on invalid \
 input. Those are valuable tests, but only when the PRD requests them.
+- VERIFYING A BARE "user can log in" CRITERION (no success indicator stated in the \
+PRD): the expected_outcome must be a NEUTRAL post-login signal that does not invent \
+UI copy — prefer "a post-login control such as a Logout button/link is visible" or \
+"the login form is no longer visible" or "the URL is no longer the login page". \
+NEVER assert a welcome/greeting message or that the entered username is shown, \
+unless the PRD explicitly says so.
 - Use Gherkin steps (Given/When/Then/And). Be CONCRETE: name buttons, fields, and expected \
 page text. A playwright test must be writable from these steps alone.
 - IDs are kebab-case, derived from the title.
@@ -164,6 +174,12 @@ because it reflects the actual source code of the app under test:
     `inv.get("itemName")` — never `inv.get("invoice_number")`. Some entries in \
     `response_fields` may be noise (e.g. `__main__`, `error`); pick names that \
     semantically match what you're checking.
+  • NUMERIC FIELDS — compare as NUMBERS, never as strings. JSON serializes \
+    numbers inconsistently (a price of 10 may come back as `10.0`), so \
+    `str(inv.get("price")) == "10"` FAILS because "10.0" != "10". Always write \
+    `float(inv.get("price")) == 10` (or `int(...)` for integer fields like qty/ \
+    counts). Reserve string equality for genuinely textual fields (names, ids \
+    that are strings).
   • Use Python's `requests` module via `import requests` (already available).
   • Backend assertions are appropriate when the TestCase's expected_outcome \
     talks about persistence or state changes the UI alone can't verify.
@@ -246,24 +262,35 @@ Hard rules:
    "Sales price") and `row` entries (e.g. "Pencil", "Bottle") in the same table, \
    produce code in this exact shape:
    ```python
-   row = page.get_by_role("row").filter(has_text="Pencil")
+   table = page.locator("#items-table")  # the row/columnheader entries' container_id
+   row = table.get_by_role("row").filter(has_text="Pencil")
    qty_cell = row.get_by_role("cell").nth(1)  # column index from columnheader order
    initial_qty = int(qty_cell.inner_text())
    snap("captured initial pencil qty")
    # ... user actions: create invoice, fill form, click Save ...
-   page.get_by_role("link", name="Item Master", exact=True).click()
+   page.goto("<resolved item-master url>")  # be on the page where the table is VISIBLE
    snap("back on item master")
-   row = page.get_by_role("row").filter(has_text="Pencil")
+   table = page.locator("#items-table")
+   row = table.get_by_role("row").filter(has_text="Pencil")
    qty_cell = row.get_by_role("cell").nth(1)
    expect(qty_cell).to_have_text(str(initial_qty - 3))
    snap("verify pencil qty decreased by 3")
    ```
    Rules for table queries (these supersede rule 14's `exact=True` blanket):
-     - For `row`: ALWAYS use `page.get_by_role("row").filter(has_text="<name>")`. \
-       Do NOT pass `name=` or `exact=True` — a row's accessible name is its full \
-       cell-text concatenation, which changes when values update.
+     - ALWAYS SCOPE TO THE TABLE. Every `row`/`columnheader`/`cell` SiteMap entry \
+       carries a `container_id` (the table's id, e.g. `items-table`). You MUST \
+       prefix the row lookup with `page.locator("#<container_id>")`, i.e. \
+       `page.locator("#items-table").get_by_role("row").filter(has_text="<name>")`. \
+       NEVER use a bare `page.get_by_role("row")` — the page has multiple tables \
+       (e.g. an items table AND an invoices table) and the same name (e.g. "Mobile") \
+       appears as rows in BOTH; an unscoped lookup matches several rows and the read \
+       raises a strict-mode error or reads the wrong table. \
+     - For `row`: use `.filter(has_text="<name>")` — do NOT pass `name=` or \
+       `exact=True` (a row's accessible name is its full cell-text concatenation, \
+       which changes when values update). \
      - Column index in `.nth(N)` is zero-based. Determine N from the order of \
-       `columnheader` entries in the SiteMap (first columnheader = 0, etc.).
+       `columnheader` entries (within that same table's `container_id`) in the \
+       SiteMap (first columnheader = 0, etc.).
 8. Substitute `{key}` references from the Gherkin steps with the matching value from the \
    answers dict provided. If a `{key}` referenced in the steps is NOT in answers, write \
    `# NEEDS: value for {key}` instead of inventing.
@@ -316,6 +343,48 @@ Hard rules:
     * Use the same `{{name}}` token everywhere that value is needed within the test. \
     The pipeline replaces these tokens with `@pytest.mark.parametrize` after you \
     finish, so the test runs once per dataset value automatically — you write it ONCE.
+17. BE ON THE PAGE WHERE AN ELEMENT IS VISIBLE — for ANY interaction, including \
+    reading a value (`.inner_text()`), asserting (`expect(...).to_be_visible()` / \
+    `.to_have_text(...)`), filling, selecting, or clicking. This app is a single- \
+    page app that keeps every form and table mounted in the DOM but HIDDEN unless \
+    you are on their route. The SiteMap lists each element as `[VISIBLE]` or \
+    `[HIDDEN]` per page — an element marked `[HIDDEN]` exists but cannot be read or \
+    interacted with and WILL time out. \
+    * To use a FORM field, `page.goto(<form-url>)` (e.g. `/#/invoices/new`). Do NOT \
+      reach a form by clicking a nav link that lands on a list/landing page (e.g. \
+      "Invoice Creation" → `/#/invoices` shows only a "Create Invoice" button; the \
+      fields there are HIDDEN). \
+    * To READ or ASSERT a TABLE value (e.g. an item's "Quantity available" in Item \
+      Master), you MUST first `page.goto` the page where that table is `[VISIBLE]` \
+      (e.g. `/#/items`). Reading `get_by_role("row").filter(has_text="X")` while on \
+      a different route (like the invoice page) times out because the table is \
+      HIDDEN there. Capture the "before" value on the table's own page, then \
+      navigate away to perform the action, then return to the table's page to read \
+      the "after" value. \
+    * If an element is `[HIDDEN]` on the page you are on, you are on the wrong page: \
+      `page.goto` the URL where it is `[VISIBLE]` (or click the control that reveals \
+      it) BEFORE touching it.
+19. VERIFY LOGIN WITH A REAL POST-LOGIN ELEMENT — never a guessed greeting. To \
+    confirm a successful login, assert that a stable element which only exists \
+    AFTER login is visible — pick one from the SiteMap, in this order of \
+    preference: a `button`/`link` named "Logout" (or "Sign out"), then any other \
+    post-login nav element present in the SiteMap. Write e.g. \
+    `expect(page.get_by_role("button", name="Logout", exact=True)).to_be_visible()`. \
+    Do NOT assert a "welcome"/"greeting" message, and do NOT assert that the typed \
+    username appears, unless the TestCase explicitly quotes that text. NEVER invent \
+    a `get_by_role("heading", name=<username>)` — the username is rarely a heading \
+    and is not a reliable login signal.
+18. ASSERT THE EXACT QUOTED CONFIRMATION. When the TestCase steps or \
+    expected_outcome quote a specific success/confirmation message (e.g. \
+    'Invoice saved.'), you MUST assert on THAT EXACT string with \
+    `expect(page.get_by_text("<exact message>", exact=True)).to_be_visible()`. \
+    The quoted message is the source of truth. Do NOT substitute a different \
+    element you happen to see in the SiteMap (a heading, a different label, a \
+    status div with other text) as a stand-in for success — even if it looks \
+    related (e.g. a "Invoice Created" heading). Prefer the SiteMap entry whose \
+    role is `text` and whose name matches the quoted message. If no SiteMap entry \
+    matches the quoted message, write `# NEEDS: confirmation text "<message>"` \
+    rather than asserting on a different element.
 """
 
 REPORTER_SYSTEM = """You write concise QA reports. Given the TestSpec, generated test \
@@ -373,13 +442,21 @@ Apply ALL of these rules (same as the Coder):
     * "strict mode violation: resolved to N elements" → the locator matched multiple \
       elements. Add `exact=True`, or scope to the right form via the SiteMap's \
       `container_id` (e.g. `page.locator("#<container_id>").get_by_role(...)`). \
-    * "Timeout … waiting for get_by_role(...)" → that role+name does NOT exist in the \
-      FRESH SiteMap. Find the closest matching SiteMap entry and use its EXACT role \
-      and name. \
-    * "locator NOT in SiteMap: get_by_role(role='cell')" → use the table drill-down \
-      pattern: `row = page.get_by_role("row").filter(has_text="X"); cell = \
-      row.get_by_role("cell").nth(N)`. The column index N comes from the order of \
-      `columnheader` entries in the SiteMap (zero-based).
+    * "Timeout … waiting for get_by_role(...)" → either that role+name does NOT \
+      exist in the FRESH SiteMap (find the closest matching entry and use its EXACT \
+      role+name), OR the element is present but `[HIDDEN]` on the page the test is \
+      on. If it's `[HIDDEN]`, the test reached a list/landing page instead of the \
+      form: `page.goto` the form's own URL (e.g. `/#/invoices/new`) where the field \
+      is `[VISIBLE]`, or click the button that opens the form, before interacting. \
+    * "locator NOT in SiteMap: get_by_role(role='cell')" or a timeout reading a \
+      table row → use the SCOPED table drill-down pattern: `table = \
+      page.locator("#<container_id>"); row = table.get_by_role("row").filter( \
+      has_text="X"); cell = row.get_by_role("cell").nth(N)`. ALWAYS scope to the \
+      table's `container_id` (e.g. `#items-table`) — a bare `page.get_by_role("row")` \
+      matches rows across multiple tables (items AND invoices) where the same name \
+      appears, causing strict-mode errors or wrong reads. Be on the page where that \
+      table is `[VISIBLE]` first. Column index N is zero-based from the \
+      `columnheader` order within that table.
 
 14. ROLE → VERB TABLE (same as the Coder; use the source-hint tag if it disagrees \
     with the SiteMap role): \
@@ -392,6 +469,13 @@ Apply ALL of these rules (same as the Coder):
 
 15. SELF-REVIEW before output. Scan your rewritten code for any of the role/verb \
     mismatches in rule 14 and silently fix them.
+
+16. CONFIRMATION ASSERTIONS — if the test failed on a "to_be_visible" check for \
+    an element that doesn't exist (e.g. a `heading "Invoice Created"`), and the \
+    TestCase quotes a specific confirmation message (e.g. 'Invoice saved.'), \
+    rewrite the assertion to target THAT exact message: \
+    `expect(page.get_by_text("<exact message>", exact=True)).to_be_visible()`. \
+    Never assert on a look-alike element as a stand-in for the quoted message.
 
 16. PRESERVE PARAMETRIZATION — if the code you receive has a \
     `@pytest.mark.parametrize(...)` decorator and matching function parameters, keep \

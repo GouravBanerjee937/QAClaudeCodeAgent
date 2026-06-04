@@ -12,6 +12,7 @@ from qa_agent import pipeline, prd
 from qa_agent.datasets import validate as dataset_validate
 from qa_agent.events import Event, EventBus
 from qa_agent.models import Question
+from qa_agent.steps.coder import resolve_url
 
 st.set_page_config(page_title="QA Autonomous Agent", page_icon="🧪", layout="wide")
 
@@ -113,7 +114,7 @@ def reset() -> None:
     for k in (
         "phase", "events", "phase_a", "answers", "phase_b", "error",
         "source_insights", "human_plan", "human_sitemap", "human_generated",
-        "phase_b_partial", "url_problems",
+        "phase_b_partial", "url_problems", "prescan_routes",
     ):
         st.session_state.pop(k, None)
 
@@ -138,6 +139,94 @@ def render_log() -> None:
             for e in st.session_state.events
         ]
         st.markdown("\n\n".join(lines))
+
+
+# ─────────────── Reusable "pick from my recommendations" component ───────────
+# Whenever the agent is unsure (a URL, an element, an item, a missing value), it
+# renders this: a dropdown of REAL candidates (gathered live from GitHub source /
+# the app's own API / SiteMap — never hardcoded) plus an always-visible "type your
+# own" override. Defined early so every phase (incl. the questions screen) can use it.
+
+_REC_PLACEHOLDER = "— select —"
+
+
+def _recommend_widget(label: str, options, key: str, *, help: str = "") -> None:
+    """Render a recommendation dropdown + a custom-value override. Read the result
+    later with `_recommend_value(key)`. Safe inside st.form (both widgets always
+    render; the override wins when non-empty)."""
+    opts = [_REC_PLACEHOLDER] + list(dict.fromkeys(str(o) for o in options if str(o).strip()))
+    st.selectbox(label, options=opts, index=0, key=f"{key}_sel", help=help or None)
+    st.text_input(
+        "…or type your own (overrides the dropdown)",
+        key=f"{key}_custom",
+        placeholder="leave blank to use the dropdown choice above",
+    )
+
+
+def _recommend_value(key: str) -> str:
+    """Resolve a `_recommend_widget`: the custom override if typed, else the
+    dropdown choice, else '' (nothing chosen)."""
+    custom = (st.session_state.get(f"{key}_custom") or "").strip()
+    if custom:
+        return custom
+    sel = st.session_state.get(f"{key}_sel") or ""
+    return sel if sel and sel != _REC_PLACEHOLDER else ""
+
+
+def _api_value_recommendations(question, spec, source_insights) -> list[str]:
+    """Live candidate values for a missing value, fetched from the app's OWN API —
+    using the endpoints the GitHub source reader discovered. E.g. a question about
+    the 'invoice item' is matched to `GET /api/items`, which is fetched live; the
+    name-like field of each returned row becomes a recommendation (bottle/Pencil/
+    Mobile). Nothing is hardcoded — it's read from the running app. Returns [] if
+    there's no matching endpoint or the fetch fails."""
+    import re as _re
+    from urllib.parse import urlparse as _urlparse
+
+    if not source_insights or not getattr(source_insights, "api_endpoints", None):
+        return []
+    qtext = f"{question.key} {question.prompt} {question.hint}".lower()
+    qtokens = {t for t in _re.split(r"[^a-z0-9]+", qtext) if len(t) >= 3}
+
+    # Find a GET endpoint whose last path segment overlaps the question's words.
+    target = None
+    for ep in source_insights.api_endpoints:
+        if ep.method.upper() != "GET":
+            continue
+        seg = ep.path.rstrip("/").split("/")[-1].lower()  # /api/items -> items
+        seg_sing = seg[:-1] if seg.endswith("s") else seg  # items -> item
+        if any(seg in t or t in seg or seg_sing in t or t in seg_sing for t in qtokens):
+            target = ep
+            break
+    if not target:
+        return []
+
+    parsed = _urlparse(spec.app_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else ""
+    if not origin:
+        return []
+    try:
+        import requests
+        resp = requests.get(origin + target.path, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+
+    name_keys = ["name", "itemname", "title", "label", "item"]
+    out: list[str] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        lowered = {k.lower(): v for k, v in row.items()}
+        for nk in name_keys:
+            if nk in lowered and isinstance(lowered[nk], str) and lowered[nk].strip():
+                if lowered[nk] not in out:
+                    out.append(lowered[nk])
+                break
+    return out
 
 
 st.title("🧪 QA Autonomous Agent")
@@ -344,6 +433,18 @@ if st.session_state.phase == "phase_a":
         else:
             st.session_state.phase_a = phase_a
             st.session_state.phase = "questions"
+            # Pre-scan the live app for route suggestions — done once here so
+            # the questions UI can offer real URLs as dropdown options.
+            st.session_state.prescan_routes = []
+            if phase_a.questions.items and any(
+                q.kind == "url" for q in phase_a.questions.items
+            ):
+                from qa_agent.steps.explorer import pre_scan
+                provided_so_far = {**phase_a.spec.provided_values_dict}
+                with st.spinner("Scanning live app for URL suggestions…"):
+                    st.session_state.prescan_routes = pre_scan(
+                        phase_a.spec.app_url, provided_so_far, bus_for_session()
+                    )
             st.rerun()
 
 
@@ -409,26 +510,93 @@ if st.session_state.phase == "questions":
                     st.markdown("**API endpoints:**")
                     for ep in si.api_endpoints:
                         st.code(ep.describe(), language=None)
+        # Build suggestion list for URL questions: pre-scan routes + GitHub routes.
+        _url_suggestions = list(dict.fromkeys(
+            st.session_state.get("prescan_routes", [])
+            + [
+                resolve_url(spec.app_url, r)
+                for r in (
+                    st.session_state.get("source_insights").routes
+                    if st.session_state.get("source_insights")
+                    else []
+                )
+            ]
+        ))
+
+        # URL questions are rendered OUTSIDE the form so the selectbox can
+        # trigger a rerun to show/hide the manual text input immediately.
+        url_questions = [q for q in questions if q.kind == "url"]
+        other_questions = [q for q in questions if q.kind != "url"]
+        url_answers: dict[str, str] = {}
+
+        for q in url_questions:
+            st.markdown(f"**{q.prompt}**")
+            if q.hint:
+                st.caption(q.hint)
+            options = _url_suggestions + ["Other (enter manually)"]
+            sel_key = f"sel::{q.key}"
+            sel = st.selectbox(
+                q.prompt, options=options, key=sel_key,
+                label_visibility="collapsed",
+            )
+            if sel == "Other (enter manually)":
+                val = st.text_input(
+                    "Enter URL", key=f"txt::{q.key}",
+                    value=provided.get(q.key, ""),
+                    placeholder="e.g. http://localhost:3000/#/items",
+                )
+            else:
+                val = sel
+                st.code(val, language=None)
+            if q.reason:
+                st.caption(f"_{q.reason}_")
+            url_answers[q.key] = val
+
+        # Pre-fetch live API recommendations once (e.g. real item names from
+        # GET /api/items), cached so we don't refetch on every rerun.
+        _api_cache = st.session_state.setdefault("_api_recs_cache", {})
+        _si = st.session_state.get("source_insights")
+        for q in other_questions:
+            if q.kind != "password" and q.key not in _api_cache:
+                _api_cache[q.key] = _api_value_recommendations(q, spec, _si)
+
         with st.form("answers_form"):
             answers: dict[str, str] = {}
-            for q in questions:
+            rec_keys: dict[str, str] = {}
+            for q in other_questions:
                 widget_key = f"q::{q.key}"
                 default = provided.get(q.key, "")
-                if q.kind == "password":
-                    val = st.text_input(q.prompt, key=widget_key, type="password", value=default, help=q.hint or None)
+                recs = _api_cache.get(q.key, []) if q.kind != "password" else []
+                if recs:
+                    st.markdown(f"**{q.prompt}**")
+                    if q.hint:
+                        st.caption(q.hint)
+                    _recommend_widget(
+                        q.prompt, recs, widget_key,
+                        help="These are the REAL options fetched live from your app's API — pick one or type your own.",
+                    )
+                    rec_keys[q.key] = widget_key
+                elif q.kind == "password":
+                    answers[q.key] = st.text_input(
+                        q.prompt, key=widget_key, type="password", value=default, help=q.hint or None
+                    )
                 else:
-                    val = st.text_input(q.prompt, key=widget_key, value=default, help=q.hint or None)
+                    answers[q.key] = st.text_input(
+                        q.prompt, key=widget_key, value=default, help=q.hint or None
+                    )
                 if q.reason:
                     st.caption(f"_{q.reason}_")
-                answers[q.key] = val
             submitted = st.form_submit_button("▶ Continue", type="primary")
             if submitted:
-                missing = [q.key for q in questions if not answers.get(q.key)]
+                for _qk, _wk in rec_keys.items():
+                    answers[_qk] = _recommend_value(_wk)
+                all_answers = {**url_answers, **answers}
+                missing = [q.key for q in questions if not all_answers.get(q.key)]
                 if missing:
                     st.warning(f"Please fill in: {', '.join(missing)}")
                 else:
                     # Merge: PRD-extracted values first, form answers override.
-                    st.session_state.answers = {**provided, **answers}
+                    st.session_state.answers = {**provided, **all_answers}
                     st.session_state.phase = "phase_b"
                     st.rerun()
 
@@ -455,6 +623,52 @@ def _attach_live_feed(bus: "EventBus", status) -> None:
         feed.markdown("\n\n".join(live_lines[-25:]))
 
     bus.subscribe(live_sink)
+
+
+def _url_recommendations(problem: dict) -> list[str]:
+    """Live URL candidates for a doubtful URL: every GitHub source route resolved
+    to a full URL, plus the agent's best-guess suggestion. Never hardcoded."""
+    from qa_agent.steps.coder import resolve_url
+
+    app_url = st.session_state.phase_a.spec.app_url
+    out: list[str] = []
+    si = st.session_state.get("source_insights")
+    if si and getattr(si, "routes", None):
+        for r in si.routes:
+            try:
+                out.append(resolve_url(app_url, r))
+            except Exception:
+                out.append(r)
+    if problem.get("suggestion"):
+        out.append(problem["suggestion"])
+    return out
+
+
+def _sitemap_selects(sitemap) -> dict[str, list[str]]:
+    """Real <select> dropdowns found by the Explorer: {select_id: [option_text,…]}.
+    The option entries carry container_id = the select's id and a name like
+    'Mobile   | value="3"'. We strip the `| value=…` suffix for display, drop the
+    empty placeholder option, and keep only selects with at least one real choice."""
+    out: dict[str, list[str]] = {}
+    if not sitemap:
+        return out
+    for snap in sitemap.pages.values():
+        for el in getattr(snap, "elements", []):
+            if el.role != "option":
+                continue
+            text = el.name.split("|")[0].strip()  # 'Mobile   | value="3"' -> 'Mobile'
+            low = text.lower()
+            if not text or low.startswith("select ") or low in ("select", "select an item"):
+                continue
+            out.setdefault(el.container_id, [])
+            if text not in out[el.container_id]:
+                out[el.container_id].append(text)
+    return {sid: opts for sid, opts in out.items() if opts}
+
+
+def _has_selects(sitemap) -> bool:
+    """True if the explored page has any real <select> dropdown to confirm."""
+    return bool(_sitemap_selects(sitemap))
 
 
 # Stage B1 — Designer + Explorer, then check whether every planned URL was
@@ -485,7 +699,9 @@ if st.session_state.phase == "phase_b":
                 st.session_state.phase = "verify_urls"
             else:
                 status.update(label="✅ Exploration complete", state="complete")
-                st.session_state.phase = "phase_b_finish"
+                st.session_state.phase = (
+                    "confirm_items" if _has_selects(partial.sitemap) else "phase_b_finish"
+                )
             st.rerun()
 
 
@@ -528,37 +744,30 @@ if st.session_state.phase == "verify_urls":
                    f"(not in your PRD, not in the GitHub source, not in your answers).")
     if n_unreach:
         msg.append(f"{n_unreach} URL(s) that didn't return a usable page.")
-    st.caption(" ".join(msg) + " Enter the correct URL for each. My best guess is "
-               "pre-filled as a suggestion — change it if it's wrong.")
-    # Show all GitHub source routes once at the top so the user can copy from them.
-    si = st.session_state.get("source_insights")
-    if si and getattr(si, "routes", None):
-        with st.expander(f"📂 {len(si.routes)} route(s) found in your GitHub source — click to view", expanded=True):
-            st.write("These are the routes the GitHub source reader extracted. "
-                     "Copy whichever one is the right page for the test below.")
-            app_url = st.session_state.phase_a.spec.app_url
-            for r in si.routes:
-                # Build the full URL form too, so a copy is one click away
-                from qa_agent.steps.coder import resolve_url
-                full = resolve_url(app_url, r)
-                st.code(f"{r}        →  {full}", language=None)
+    st.caption(" ".join(msg) + " Pick the right URL from my recommendations "
+               "(pulled from your GitHub source), or type your own. I won't proceed "
+               "until you choose one for each.")
     with st.form("verify_urls_form"):
-        corrections: dict[str, str] = {}
+        keymap: dict[str, str] = {}
         for i, p in enumerate(problems):
             reason_tag = "🤖 GUESSED" if p.get("reason") == "guess" else "🚫 UNREACHABLE"
             st.markdown(f"**Test `{p['test_case_id']}`** — {reason_tag}")
             st.caption(f"Planned URL: `{p['url']}`")
-            corrections[f"{p['test_case_id']}::{p['url']}"] = st.text_input(
-                "Correct URL",
-                value=p["suggestion"],
-                key=f"url_fix_{i}",
-                help="Suggestion pre-filled from my best guess — edit if it's wrong. "
-                     "If your GitHub source has the right route, copy it from the panel above.",
+            key = f"url_fix_{i}"
+            _recommend_widget(
+                "Correct URL", _url_recommendations(p), key,
+                help="Recommendations come from your GitHub source routes + my best guess.",
             )
+            keymap[f"{p['test_case_id']}::{p['url']}"] = key
             st.divider()
         submitted = st.form_submit_button("▶ Use these URLs & continue", type="primary")
 
     if submitted:
+        corrections = {k: _recommend_value(key) for k, key in keymap.items()}
+        unchosen = [k for k, v in corrections.items() if not v]
+        if unchosen:
+            st.warning("Please choose (or type) a URL for every item before continuing.")
+            st.stop()
         partial = st.session_state.phase_b_partial
         for tc in partial.plan.test_cases:
             tc.page_urls = [
@@ -586,8 +795,59 @@ if st.session_state.phase == "verify_urls":
             st.warning("Some URLs still need confirmation — please correct them and try again.")
             st.rerun()
         else:
-            st.session_state.phase = "phase_b_finish"
+            st.session_state.phase = (
+                "confirm_items" if _has_selects(partial.sitemap) else "phase_b_finish"
+            )
             st.rerun()
+    render_log()
+
+
+# Stage B1.7 — confirm which option each <select> dropdown should pick, using the
+# REAL options scraped from the page (Mobile / bottle / Pencil …). Pre-selected to
+# whatever the PRD named; the user can change it. Shared by both flows.
+if st.session_state.phase == "confirm_items":
+    _human = st.session_state.get("enable_human")
+    _sm = (st.session_state.get("human_sitemap") if _human
+           else getattr(st.session_state.get("phase_b_partial"), "sitemap", None))
+    _selects = _sitemap_selects(_sm)
+    _next_phase = "human_code" if _human else "phase_b_finish"
+    if not _selects:
+        st.session_state.phase = _next_phase
+        st.rerun()
+    st.subheader("🔽 Confirm dropdown selections")
+    st.caption(
+        "Your app has dropdown(s). These are the REAL options scraped from the page. "
+        "I've pre-selected the item your PRD named — change it if you want a different one."
+    )
+    _answer_vals = [str(v).strip().lower() for v in st.session_state.answers.values()]
+    with st.form("confirm_items_form"):
+        _picks: dict[str, str] = {}
+        for _sid, _opts in _selects.items():
+            _default_idx = 0
+            for _ix, _o in enumerate(_opts):
+                if _o.lower() in _answer_vals:
+                    _default_idx = _ix
+                    break
+            _picks[_sid] = st.selectbox(
+                f"Dropdown `#{_sid}` — which option should the test select?",
+                options=_opts, index=_default_idx, key=f"confsel_{_sid}",
+            )
+        _submitted = st.form_submit_button("▶ Use these selections & continue", type="primary")
+    if _submitted:
+        _answers = dict(st.session_state.answers)
+        for _sid, _opts in _selects.items():
+            _chosen = _picks[_sid]
+            _opt_low = {o.lower() for o in _opts}
+            _replaced = False
+            for _k, _v in list(_answers.items()):
+                if str(_v).strip().lower() in _opt_low:
+                    _answers[_k] = _chosen
+                    _replaced = True
+            if not _replaced:
+                _answers[_sid.replace("-", "_")] = _chosen
+        st.session_state.answers = _answers
+        st.session_state.phase = _next_phase
+        st.rerun()
     render_log()
 
 
@@ -848,6 +1108,32 @@ def _human_bus():
     return bus_for_session()
 
 
+_GHERKIN_KEYWORDS = {"given", "when", "then", "and", "but"}
+
+
+def _parse_steps(text: str) -> list[TestStep]:
+    """Parse a user-edited steps text area (one step per line) back into TestSteps.
+
+    Each line should start with a Gherkin keyword (Given/When/Then/And/But). If a
+    line omits the keyword, we default to 'And' (or 'Given' for the first line) so
+    nothing is lost. Blank lines are ignored.
+    """
+    steps: list[TestStep] = []
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("-•").strip()
+        if not line:
+            continue
+        first, _, rest = line.partition(" ")
+        kw = first.capitalize()
+        if first.lower() in _GHERKIN_KEYWORDS and rest.strip():
+            steps.append(TestStep(keyword=("And" if kw == "But" else kw), text=rest.strip()))
+        else:
+            # No recognizable keyword — keep the whole line as text.
+            default_kw = "Given" if not steps else "And"
+            steps.append(TestStep(keyword=default_kw, text=line))
+    return steps
+
+
 # Stage 1 — run Designer (and placeholder resolution), then hand to review.
 if st.session_state.phase == "human_design":
     st.session_state.events = []
@@ -880,13 +1166,15 @@ if st.session_state.phase == "human_review_plan":
     plan: TestPlan = st.session_state.human_plan
     st.subheader("📋 Step 1 of 2 — Review the test plan")
     st.caption(
-        "Untick any test case you don't want. Edit the title or expected outcome inline. "
-        "Click ▶ Continue when you're happy with the list."
+        "Untick any test case you don't want. Edit the title, expected outcome, "
+        "the Gherkin steps, and the URLs inline. Click ▶ Continue when you're happy."
     )
 
     keep_flags: list[bool] = []
     titles: list[str] = []
     outcomes: list[str] = []
+    steps_texts: list[str] = []
+    urls_texts: list[str] = []
     for i, tc in enumerate(plan.test_cases):
         with st.expander(f"`{tc.id}` — {tc.title}", expanded=False):
             keep = st.checkbox("Keep this test", value=True, key=f"keep_{i}")
@@ -894,14 +1182,23 @@ if st.session_state.phase == "human_review_plan":
             new_outcome = st.text_area(
                 "Expected outcome", value=tc.expected_outcome, key=f"outcome_{i}", height=70,
             )
-            st.markdown("**Steps** (read-only):")
-            steps_md = "\n".join([f"- **{s.keyword}** {s.text}" for s in tc.steps])
-            st.markdown(steps_md or "_(no steps)_")
-            urls_md = ", ".join([f"`{u}`" for u in tc.page_urls]) or "_(none)_"
-            st.caption(f"URLs: {urls_md}")
+            st.markdown("**Steps** — one per line, start each with Given / When / Then / And:")
+            steps_value = "\n".join(f"{s.keyword} {s.text}" for s in tc.steps)
+            new_steps = st.text_area(
+                "Steps", value=steps_value, key=f"steps_{i}", height=160,
+                label_visibility="collapsed",
+            )
+            new_urls = st.text_input(
+                "URLs (comma-separated)",
+                value=", ".join(tc.page_urls),
+                key=f"urls_{i}",
+                help="Pages this test visits. Edit if a URL is wrong.",
+            )
         keep_flags.append(keep)
         titles.append(new_title)
         outcomes.append(new_outcome)
+        steps_texts.append(new_steps)
+        urls_texts.append(new_urls)
 
     col1, col2 = st.columns([1, 4])
     with col1:
@@ -910,12 +1207,14 @@ if st.session_state.phase == "human_review_plan":
             for i, tc in enumerate(plan.test_cases):
                 if not keep_flags[i]:
                     continue
+                parsed_steps = _parse_steps(steps_texts[i]) or tc.steps
+                parsed_urls = [u.strip() for u in urls_texts[i].split(",") if u.strip()] or tc.page_urls
                 new_cases.append(
                     TestCase(
                         id=tc.id,
                         title=titles[i].strip() or tc.title,
-                        page_urls=tc.page_urls,
-                        steps=tc.steps,
+                        page_urls=parsed_urls,
+                        steps=parsed_steps,
                         expected_outcome=outcomes[i].strip() or tc.expected_outcome,
                     )
                 )
@@ -957,7 +1256,9 @@ if st.session_state.phase == "human_explore_code":
                 st.session_state.phase = "human_verify_urls"
             else:
                 status.update(label="✅ Exploration complete", state="complete")
-                st.session_state.phase = "human_code"
+                st.session_state.phase = (
+                    "confirm_items" if _has_selects(sitemap) else "human_code"
+                )
             st.rerun()
 
 
@@ -966,25 +1267,29 @@ if st.session_state.phase == "human_verify_urls":
     problems = st.session_state.get("url_problems", [])
     st.subheader("🛑 Confirm these URLs — I won't guess")
     st.caption(
-        "The Explorer couldn't load a usable page for the URL(s) below (the page was "
-        "missing, or returned no interactable elements). Enter the correct URL for each. "
-        "My best guess is pre-filled as a suggestion — change it if it's wrong."
+        "Pick the right URL from my recommendations (pulled from your GitHub source), "
+        "or type your own. I won't proceed until you choose one for each."
     )
     with st.form("human_verify_urls_form"):
-        corrections: dict[str, str] = {}
+        keymap: dict[str, str] = {}
         for i, p in enumerate(problems):
-            st.markdown(f"**Test `{p['test_case_id']}`** needs a page it couldn't reach.")
-            st.caption(f"Planned URL that failed: `{p['url']}`")
-            corrections[f"{p['test_case_id']}::{p['url']}"] = st.text_input(
-                "Correct URL",
-                value=p["suggestion"],
-                key=f"h_url_fix_{i}",
-                help="Suggestion pre-filled from my best guess — edit if it's wrong.",
+            reason_tag = "🤖 GUESSED" if p.get("reason") == "guess" else "🚫 UNREACHABLE"
+            st.markdown(f"**Test `{p['test_case_id']}`** — {reason_tag}")
+            st.caption(f"Planned URL: `{p['url']}`")
+            key = f"h_url_fix_{i}"
+            _recommend_widget(
+                "Correct URL", _url_recommendations(p), key,
+                help="Recommendations come from your GitHub source routes + my best guess.",
             )
+            keymap[f"{p['test_case_id']}::{p['url']}"] = key
             st.divider()
         submitted = st.form_submit_button("▶ Use these URLs & continue", type="primary")
 
     if submitted:
+        corrections = {k: _recommend_value(key) for k, key in keymap.items()}
+        if [k for k, v in corrections.items() if not v]:
+            st.warning("Please choose (or type) a URL for every item before continuing.")
+            st.stop()
         spec = st.session_state.phase_a.spec
         plan = st.session_state.human_plan
         # Patch the failed URLs in the plan with the user's corrections.
@@ -1016,7 +1321,9 @@ if st.session_state.phase == "human_verify_urls":
             )
             st.rerun()
         else:
-            st.session_state.phase = "human_code"
+            st.session_state.phase = (
+                "confirm_items" if _has_selects(sitemap) else "human_code"
+            )
             st.rerun()
     render_log()
 

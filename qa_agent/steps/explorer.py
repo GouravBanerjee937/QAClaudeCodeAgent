@@ -320,6 +320,61 @@ def _quiet_wait(page: Page) -> None:
         pass
 
 
+def pre_scan(app_url: str, answers: dict[str, str], bus: EventBus) -> list[str]:
+    """Log into the live app and return every same-origin route discovered via <a href>.
+
+    Used to populate suggestion dropdowns when the pipeline needs to ask the user
+    for a URL — instead of guessing, we show real routes from the running app.
+    Returns absolute URLs, e.g. ["http://localhost:3000/#/items", ...].
+    """
+    email, password = _detect_credentials(answers)
+    discovered: list[str] = []
+    bus.emit("explorer", "Pre-scanning live app for route suggestions…")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(ignore_https_errors=True)
+                page = context.new_page()
+                page.goto(app_url, wait_until="domcontentloaded", timeout=30_000)
+                _quiet_wait(page)
+                # Attempt login so auth-gated links become visible.
+                if email and password:
+                    _probe_login_states(page, _scrape_elements(page), email, password, bus)
+                    _quiet_wait(page)
+                # Collect all same-origin <a href> links.
+                from urllib.parse import urlparse
+                base_origin = urlparse(app_url).netloc
+                hrefs: list[str] = page.eval_on_selector_all(
+                    "a[href]", "els => els.map(e => e.getAttribute('href'))"
+                )
+                seen: set[str] = set()
+                for href in hrefs:
+                    if not href or href.startswith("javascript"):
+                        continue
+                    absolute = resolve_url(app_url, href)
+                    parsed = urlparse(absolute)
+                    # Keep only same-origin routes; skip the bare app_url itself.
+                    if parsed.netloc != base_origin:
+                        continue
+                    if absolute == app_url or absolute.rstrip("/") == app_url.rstrip("/"):
+                        continue
+                    if absolute not in seen:
+                        seen.add(absolute)
+                        discovered.append(absolute)
+                context.close()
+            finally:
+                browser.close()
+    except Exception as exc:
+        bus.emit("explorer", f"Pre-scan failed: {exc}", level="warn")
+    bus.emit(
+        "explorer",
+        f"Pre-scan found {len(discovered)} route(s): {', '.join(discovered) or 'none'}",
+        level="info" if discovered else "warn",
+    )
+    return discovered
+
+
 def _collect_urls(spec: TestSpec, plan: TestPlan) -> dict[str, str]:
     """Map each URL as written in the test plan to its absolute form."""
     base = spec.app_url
@@ -406,6 +461,19 @@ def _scrape_elements(page: Page) -> list[dict[str, str]]:
         }
         return '';
       };
+      const isVisible = (el) => {
+        // SPAs keep hidden routes/forms mounted. An element is "visible" only if it
+        // actually renders. checkVisibility() (no args) is the reliable Chromium
+        // check for display:none on the element or any ancestor; fall back to a
+        // layout-box check for older engines.
+        try {
+          if (typeof el.checkVisibility === 'function') {
+            return el.checkVisibility();
+          }
+        } catch (e) {}
+        const rects = el.getClientRects();
+        return !!(el.offsetParent !== null || (rects && rects.length > 0));
+      };
       document.querySelectorAll(
         'button, a, input, textarea, select, h1, h2, h3, [role], [aria-live], ' +
         '[class*="message" i], [class*="alert" i], [class*="toast" i], ' +
@@ -428,7 +496,7 @@ def _scrape_elements(page: Page) -> list[dict[str, str]]:
         const key = role + '::' + n + '::' + cid;
         if (seen.has(key)) return;
         seen.add(key);
-        out.push({role: role, name: n, container_id: cid});
+        out.push({role: role, name: n, container_id: cid, visible: isVisible(el)});
       });
 
       // Tables: emit column headers and each body row keyed by its first cell.
@@ -444,7 +512,7 @@ def _scrape_elements(page: Page) -> list[dict[str, str]]:
           const key = 'columnheader::' + headerName + '::' + tableId;
           if (seen.has(key)) return;
           seen.add(key);
-          out.push({role: 'columnheader', name: headerName, container_id: tableId});
+          out.push({role: 'columnheader', name: headerName, container_id: tableId, visible: isVisible(th)});
         });
         // Body rows + their cells. Row name = first cell's text (the row's natural
         // identifier, e.g. "Pencil"). Cell container_id = "<tableId>:<rowKey>" so
@@ -458,9 +526,10 @@ def _scrape_elements(page: Page) -> list[dict[str, str]]:
           if (!rowKey || rowKey.length > 100) return;
           const rowKeyClean = rowKey;
           const rowKeyId = 'row::' + rowKeyClean + '::' + tableId;
+          const rowVisible = isVisible(tr);
           if (!seen.has(rowKeyId)) {
             seen.add(rowKeyId);
-            out.push({role: 'row', name: rowKeyClean, container_id: tableId});
+            out.push({role: 'row', name: rowKeyClean, container_id: tableId, visible: rowVisible});
           }
           const cellContainer = tableId + ':' + rowKeyClean;
           tr.querySelectorAll('td').forEach((td) => {
@@ -469,7 +538,7 @@ def _scrape_elements(page: Page) -> list[dict[str, str]]:
             const ck = 'cell::' + cellText + '::' + cellContainer;
             if (seen.has(ck)) return;
             seen.add(ck);
-            out.push({role: 'cell', name: cellText, container_id: cellContainer});
+            out.push({role: 'cell', name: cellText, container_id: cellContainer, visible: rowVisible});
           });
         });
       });
@@ -480,6 +549,9 @@ def _scrape_elements(page: Page) -> list[dict[str, str]]:
       // the leading stable name, NEVER an exact text match.
       document.querySelectorAll('select').forEach((sel) => {
         const selId = sel.id || (sel.closest('[id]') ? sel.closest('[id]').id : '');
+        // An <option> has no layout box of its own; it is usable whenever its
+        // <select> is visible — so inherit the select's visibility.
+        const selVisible = isVisible(sel);
         Array.from(sel.options).forEach((opt) => {
           const text = (opt.text || opt.label || '').trim();
           const value = (opt.value || '').trim();
@@ -489,7 +561,7 @@ def _scrape_elements(page: Page) -> list[dict[str, str]]:
           const key = 'option::' + display + '::' + selId;
           if (seen.has(key)) return;
           seen.add(key);
-          out.push({role: 'option', name: display, container_id: selId});
+          out.push({role: 'option', name: display, container_id: selId, visible: selVisible});
         });
       });
       return out;
@@ -497,7 +569,11 @@ def _scrape_elements(page: Page) -> list[dict[str, str]]:
     """
     items = page.evaluate(js)
     return [
-        {"role": it["role"], "name": it["name"], "container_id": it.get("container_id", "")}
+        {
+            "role": it["role"], "name": it["name"],
+            "container_id": it.get("container_id", ""),
+            "visible": bool(it.get("visible", True)),
+        }
         for it in items
         if isinstance(it, dict) and isinstance(it.get("role"), str) and isinstance(it.get("name"), str)
     ]
@@ -557,6 +633,7 @@ def _label_elements(raw: list[dict[str, str]]) -> list[PageElement]:
                 name=el["name"],
                 purpose=PASSTHROUGH_PURPOSES.get(el["role"], "structural"),
                 container_id=el["container_id"],
+                visible=bool(el.get("visible", True)),
             )
         )
     # Then emit everything else, honouring the labeller's purposes.
@@ -574,6 +651,7 @@ def _label_elements(raw: list[dict[str, str]]) -> list[PageElement]:
                 name=el["name"],
                 purpose=purpose,
                 container_id=el["container_id"],
+                visible=bool(el.get("visible", True)),
             )
         )
     return out

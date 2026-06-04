@@ -126,7 +126,10 @@ def _rewrite(
         if not snap.elements:
             sitemap_text.append("(no labeled elements — likely auth-gated)")
         for el in snap.elements:
-            sitemap_text.append(f'- role="{el.role}", name="{el.name}"  — {el.purpose}')
+            vis = "VISIBLE" if getattr(el, "visible", True) else "HIDDEN"
+            sitemap_text.append(
+                f'- [{vis}] role="{el.role}", name="{el.name}"  — {el.purpose}'
+            )
 
     prompt = (
         f"# app_url\n{spec.app_url}\n\n"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -97,17 +98,38 @@ def _parse_junit(junit_path: Path, generated: list[GeneratedTest]) -> RunResults
 
     results: list[TestResult] = []
     for gt in generated:
-        fn = f"test_{gt.test_case_id.replace('-', '_')}"
-        r = by_function.get(fn)
+        # Match by the ACTUAL function name written in the generated file, not a
+        # name reconstructed from the test_case_id. The Coder occasionally adds a
+        # stray word (e.g. "shows_the_invoice" vs id "shows-invoice"), which would
+        # otherwise desync the report from a test that actually ran. Fall back to
+        # the id-derived name only if we can't parse a def from the code.
+        actual_fn = _function_name_in(gt.code)
+        candidates = [
+            actual_fn,
+            f"test_{gt.test_case_id.replace('-', '_')}",
+        ]
+        r = next((by_function[c] for c in candidates if c and c in by_function), None)
         if r is None:
             results.append(TestResult(
                 test_case_id=gt.test_case_id, status="error",
-                failure_message=f"pytest did not report a result for {fn}",
+                failure_message=(
+                    f"pytest did not report a result for "
+                    f"{actual_fn or gt.test_case_id}"
+                ),
             ))
         else:
             r.test_case_id = gt.test_case_id
             results.append(r)
     return RunResults(results=results)
+
+
+_DEF_RE = re.compile(r"^\s*def\s+(test_\w+)\s*\(", re.MULTILINE)
+
+
+def _function_name_in(code: str) -> str:
+    """Return the first `def test_...(` name in the generated file, or '' if none."""
+    m = _DEF_RE.search(code or "")
+    return m.group(1) if m else ""
 
 
 def _attach_artifacts(
