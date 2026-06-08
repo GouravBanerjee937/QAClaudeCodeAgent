@@ -671,6 +671,33 @@ def _has_selects(sitemap) -> bool:
     return bool(_sitemap_selects(sitemap))
 
 
+def _collect_url_problems(partial) -> list[dict]:
+    """Combine two checks: URLs the Designer guessed (not in PRD / source / answers)
+    + URLs the Explorer couldn't load. Each entry has a 'reason' so the UI can tell."""
+    spec = st.session_state.phase_a.spec
+    guessed = pipeline.guessed_urls(
+        spec, partial.plan, st.session_state.answers,
+        prd_text=st.session_state.get("prd_text", ""),
+        source_insights=st.session_state.get("source_insights"),
+    )
+    unreachable = pipeline.unreachable_urls(spec, partial.plan, partial.sitemap)
+    # Deduplicate by (test_case_id, url) — prefer 'guess' reason if both apply
+    seen, merged = set(), []
+    for p in guessed:
+        k = (p["test_case_id"], p["url"])
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(p)
+    for p in unreachable:
+        k = (p["test_case_id"], p["url"])
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append({**p, "reason": "unreachable"})
+    return merged
+
+
 # Stage B1 — Designer + Explorer, then check whether every planned URL was
 # actually reachable. If any weren't, we PAUSE and ask the user — never guess.
 if st.session_state.phase == "phase_b":
@@ -703,33 +730,6 @@ if st.session_state.phase == "phase_b":
                     "confirm_items" if _has_selects(partial.sitemap) else "phase_b_finish"
                 )
             st.rerun()
-
-
-def _collect_url_problems(partial) -> list[dict]:
-    """Combine two checks: URLs the Designer guessed (not in PRD / source / answers)
-    + URLs the Explorer couldn't load. Each entry has a 'reason' so the UI can tell."""
-    spec = st.session_state.phase_a.spec
-    guessed = pipeline.guessed_urls(
-        spec, partial.plan, st.session_state.answers,
-        prd_text=st.session_state.get("prd_text", ""),
-        source_insights=st.session_state.get("source_insights"),
-    )
-    unreachable = pipeline.unreachable_urls(spec, partial.plan, partial.sitemap)
-    # Deduplicate by (test_case_id, url) — prefer 'guess' reason if both apply
-    seen, merged = set(), []
-    for p in guessed:
-        k = (p["test_case_id"], p["url"])
-        if k in seen:
-            continue
-        seen.add(k)
-        merged.append(p)
-    for p in unreachable:
-        k = (p["test_case_id"], p["url"])
-        if k in seen:
-            continue
-        seen.add(k)
-        merged.append({**p, "reason": "unreachable"})
-    return merged
 
 
 # Stage B1.5 — pause: URLs the Designer guessed OR the Explorer couldn't load. Ask the user.
